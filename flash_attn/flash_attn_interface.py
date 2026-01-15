@@ -496,6 +496,8 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state =  _wrapped_flash_attn_forward(
             q,
             k,
@@ -512,6 +514,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -555,7 +558,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, dsink, None, None, None, None, None, None, None, None, None
+        return dqkv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
@@ -585,6 +588,8 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
             k,
@@ -606,6 +611,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens, rng_state)
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.max_seqlen = max_seqlen
             ctx.softmax_scale = softmax_scale
@@ -654,7 +660,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             rng_state=rng_state,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, dsink, None, None, None, None, None, None, None, None, None, None, None
+        return dqkv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnKVPackedFunc(torch.autograd.Function):
@@ -685,6 +691,8 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
@@ -701,6 +709,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -746,7 +755,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, dsink, None, None, None, None, None, None, None, None, None
+        return dq, dkv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
@@ -781,6 +790,8 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
             k,
@@ -804,6 +815,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             ctx.save_for_backward(
                 q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -855,7 +867,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
         )
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dkv = dkv[..., : dout.shape[-1]]
-        return dq, dkv, dsink, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dkv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -886,6 +898,8 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
@@ -902,6 +916,7 @@ class FlashAttnFunc(torch.autograd.Function):
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, learnable_sink, out_padded, softmax_lse, rng_state)
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.softmax_scale = softmax_scale
             ctx.causal = causal
@@ -946,7 +961,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, dsink, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -982,6 +997,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        sink_dtype = None if learnable_sink is None else learnable_sink.dtype
+        learnable_sink = None if learnable_sink is None else learnable_sink.float()
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
             k,
@@ -1005,6 +1022,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.save_for_backward(
                 q, k, v, learnable_sink, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state
             )
+            ctx.sink_dtype = sink_dtype
             ctx.dropout_p = dropout_p
             ctx.max_seqlen_q = max_seqlen_q
             ctx.max_seqlen_k = max_seqlen_k
@@ -1056,7 +1074,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, dsink, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, dsink.to(ctx.sink_dtype), None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
