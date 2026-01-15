@@ -651,7 +651,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     else:
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
-        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     out, lse, S_dmask = flash_attn_qkvpacked_func(
@@ -815,7 +815,7 @@ def test_flash_attn_varlen_qkvpacked(
         batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
     )
     if has_learnable_sink:
-        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
 
@@ -1030,7 +1030,7 @@ def test_flash_attn_output(
     else:
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
-        learnable_sink = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True) * 0.3
         if softcap > 0:
             learnable_sink = learnable_sink * softcap * 2
     else:
@@ -1331,7 +1331,7 @@ def test_flash_attn_varlen_output(
     else:
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     if kvpacked:
@@ -1634,7 +1634,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype, has_
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, learnable_sink=learnable_sink)
@@ -1774,7 +1774,7 @@ def test_flash_attn_varlen_causal(
             seqlen_k, paged_kv_block_size, batch_size, nheads, d, device, dtype
         )
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, device, mode="random")
@@ -1954,7 +1954,7 @@ def test_flash_attn_splitkv(
     else:
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     out, lse, _ = flash_attn_func(
@@ -2195,7 +2195,7 @@ def test_flash_attn_kvcache(
     else:
         alibi_slopes, attn_bias = None, None
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     # cache_seqlens = torch.tensor([64], dtype=torch.int32, device=device)
@@ -2407,7 +2407,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True) * 0.3
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True) * 0.3
     else:
         learnable_sink = None
     torch.random.manual_seed(42)
@@ -2477,7 +2477,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype, has_learnable_sink):
     k.requires_grad_(True)
     v.requires_grad_(True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True)
     else:
         learnable_sink = None
     out = flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink)
@@ -2542,7 +2542,7 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype, has_learnable_sink):
         for _ in range(3)
     ]
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True)
     else:
         learnable_sink = None
     out = rearrange(flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink), "b s ... -> s b ...")
@@ -2612,7 +2612,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype, has_learnable_sink):
     k.requires_grad_(True)
     v.requires_grad_(True)
     if has_learnable_sink:
-        learnable_sink = torch.randn((nheads,), device=device, dtype=torch.float32, requires_grad=True)
+        learnable_sink = torch.randn((nheads,), device=device, dtype=dtype, requires_grad=True)
     else:
         learnable_sink = None
 
