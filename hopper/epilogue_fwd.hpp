@@ -410,7 +410,8 @@ struct CollectiveEpilogueFwd {
     store_zero(
          Params const& params,
          int thread_idx,
-         cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord
+         cute::tuple<int32_t, int32_t, int32_t, int32_t> const& block_coord,
+         float lse_val=-INFINITY
          ) {
         static constexpr int kBlockM = get<0>(TileShape_MNK_PV{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
@@ -437,13 +438,13 @@ struct CollectiveEpilogueFwd {
         if (thread_idx < kBlockM) {
             const int row = m_block * kBlockM + thread_idx;
             if constexpr (!PackGQA) {
-                if (row < seqlen_o) { mLSE(row) = -INFINITY; }
+                if (row < seqlen_o) { mLSE(row) = lse_val; }
             } else {
                 if (row < seqlen_o * qhead_per_khead) {
                     int m_idx, h_idx;
                     m_idx = params.qhead_per_khead_divmod.divmod(h_idx, row);
                     // mLSE has shape ((qhead_per_khead, seqlen_q)) and it's unhappy with just 1 "make_coord"
-                    mLSE(make_coord(make_coord(h_idx, m_idx))) = -INFINITY;
+                    mLSE(make_coord(make_coord(h_idx, m_idx))) = lse_val;
                 }
             }
         }

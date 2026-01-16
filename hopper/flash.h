@@ -159,6 +159,7 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+    void *__restrict__ learnable_sink_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -205,6 +206,7 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+    void *__restrict__ dsink_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

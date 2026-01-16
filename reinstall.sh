@@ -1,14 +1,23 @@
-python setup.py bdist_wheel
+#!/bin/bash
+set -e
+
+export FLASH_ATTENTION_DISABLE_SM80="TRUE"
+export FLASH_ATTENTION_DISABLE_FP8="TRUE"
+export FLASH_ATTENTION_DISABLE_SOFTCAP="TRUE"
+# export FLASH_ATTENTION_DISABLE_LOCAL="TRUE"
+# export FLASH_ATTENTION_DISABLE_BACKWARD="TRUE"
+export FLASH_ATTENTION_DISABLE_APPENDKV="TRUE"
+
+export FLASH_ATTENTION_FORCE_BUILD="TRUE"
+
+# export FLASH_ATTENTION_DISABLE_HDIM64="TRUE"
+# export FLASH_ATTENTION_DISABLE_HDIM96="TRUE"
+# export FLASH_ATTENTION_DISABLE_HDIM128="TRUE"
+# export FLASH_ATTENTION_DISABLE_HDIM192="TRUE"
+
+export MAX_JOBS=32
 
 cd hopper
+# rm -rf __pycache__/ flash_attn_3.egg-info/ build/ dist/
 python setup.py bdist_wheel
-
-cd ../csrc/fused_dense_lib
-python setup.py bdist_wheel
-
-cd ../..
-cp dist/*.whl ./whls/
-cp hopper/dist/*.whl ./whls/
-cp csrc/fused_dense_lib/dist/*.whl ./whls/
-
-pip install ./whls/*.whl
+pip install --no-deps --force-reinstall dist/*.whl

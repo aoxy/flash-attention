@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Has_sink_>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -52,6 +52,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
+    static constexpr bool Has_sink = Has_sink_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
@@ -396,6 +397,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        float const* const ptr_Sink = nullptr;
     };
 
     // Device side kernel params
@@ -453,6 +455,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        float const* const ptr_Sink = nullptr;
     };
 
     static Params
@@ -564,7 +567,7 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_Sink};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -610,6 +613,8 @@ struct CollectiveMainloopFwdSm90 {
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
+        // shared_storage.sink_val = !Has_sink ? -INFINITY : params.ptr_Sink[bidh];
+
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
                 scheduler_prefetch();

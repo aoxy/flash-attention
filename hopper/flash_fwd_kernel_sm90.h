@@ -49,6 +49,7 @@ public:
     static constexpr int NumProducerThreads = CollectiveMainloop::NumProducerThreads;
     static constexpr bool SameHeadDim = CollectiveMainloop::SameHeadDim;
     static constexpr bool LargeHeadDimV = CollectiveMainloop::LargeHeadDimV;
+    static constexpr bool Has_sink = CollectiveMainloop::Has_sink;
     static_assert(CollectiveMainloop::LargeHeadDimV == CollectiveEpilogue::LargeHeadDimV);
     using SeqlenInfo_t = typename CollectiveMainloop::SeqlenInfo_t;
 
@@ -113,7 +114,7 @@ public:
             alignas(16) typename CollectiveMainloop::MainloopPipelineKVNew::SharedStorage pipeline_v_new;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
-
+        // float sink_val;
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -406,14 +407,16 @@ public:
                 }
                 // If there's tanh softcap, the scaling will be done before tanh.
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
+                int const bidh = get<1>(block_coord);
+                float sink_val = !Has_sink ? -INFINITY : params.mainloop.ptr_Sink[bidh];
                 if constexpr (Is_FP8 && !Has_softcap) {
-                    int const bidh = get<1>(block_coord);
                     int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
                     float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
                     float const k_descale = params.mainloop.ptr_k_descale == nullptr ? 1.0f : params.mainloop.ptr_k_descale[bidb * get<0>(params.mainloop.stride_k_descale) + bidh_kv * get<1>(params.mainloop.stride_k_descale)];
                     softmax_scale_log2 *= q_descale * k_descale;
                 }
-                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8> softmax(softmax_scale_log2);
+                if (threadIdx.x == 128) { printf("=====LargeHeadDimV=%d=get<1>(block_coord)=%d, softmax_scale_log2=%f, shared_storage.sink_val=%f, sink_val=%f\n", int(LargeHeadDimV), get<1>(block_coord), softmax_scale_log2, sink_val, sink_val); }
+                flash::Softmax<!LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2, /*Max_offset=*/!Is_FP8 ? 0 : 8, Has_sink> softmax(softmax_scale_log2, sink_val);
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));
                 bool tile_valid;
@@ -445,7 +448,8 @@ public:
                                    threadIdx.x - MmaThreadOffset, block_coord);
                 } else {
                     // Write 0 to gO and -inf to gLSE.
-                    epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord);
+                    // const float lse_val = Has_sink ? sink_val : -INFINITY;
+                    epilogue.store_zero(params.epilogue, threadIdx.x - MmaThreadOffset, block_coord, sink_val);
                 }
             }
             epilogue.store_tail();
