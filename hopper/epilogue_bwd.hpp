@@ -19,7 +19,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MNK_, class Element_, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool dKV_swapAB_, int AtomLayoutKdKV=1>
+          int NumEpilogueThreads_, bool Varlen_, bool dKV_swapAB_, int AtomLayoutKdKV=1, bool Has_sink=false>
 struct CollectiveEpilogueBwd {
 
     using TileShape_MNK = TileShape_MNK_;
@@ -114,6 +114,7 @@ struct CollectiveEpilogueBwd {
         int* dv_semaphore;
         int const* cu_seqlens;
         int const* seqused;
+        float* dsink_ptr;
     };
 
     // Device side kernel params
@@ -127,6 +128,7 @@ struct CollectiveEpilogueBwd {
         TMA_dKV tma_store_dK, tma_store_dV;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        float* dsink_ptr;
     };
 
     static Params
@@ -148,7 +150,7 @@ struct CollectiveEpilogueBwd {
             }
         }();
         return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.shape_dV, args.stride_dV,
-                tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused};
+                tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused, args.dsink_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -168,7 +170,8 @@ struct CollectiveEpilogueBwd {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          float dsink_val=0.0f
           ) {
 
         auto [n_block, bidh, bidb] = block_coord;
@@ -267,6 +270,11 @@ struct CollectiveEpilogueBwd {
                 gmem_tiled_copy_dKV, tdKVrdK, tdKVgdK, tdKVcdKV, tdKVpdK, std::min(seqlen_info.seqlen - n_block * kBlockN, kBlockN)
             );
         }
+
+        if constexpr (Has_sink) {
+            float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
+            atomicAdd(dsink_ptr + bidh, -dsink_val);
+        }
     }
 
     CUTLASS_DEVICE void
@@ -318,7 +326,7 @@ struct CollectiveEpilogueBwd {
 };
 
 template <class TileShape_MNK_, class ElementAccum, class ArchTag_,
-          int NumEpilogueThreads_, bool Varlen_, bool Deterministic>
+          int NumEpilogueThreads_, bool Varlen_, bool Deterministic, bool Has_sink=false>
 struct CollectiveEpilogueBwdGQA {
 
     using TileShape_MNK = TileShape_MNK_;
@@ -374,6 +382,7 @@ struct CollectiveEpilogueBwdGQA {
         int* dv_semaphore;
         int const* cu_seqlens;
         int const* seqused;
+        float* dsink_ptr;
     };
 
     // Device side kernel params
@@ -389,6 +398,7 @@ struct CollectiveEpilogueBwdGQA {
         int* dv_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
+        float* dsink_ptr;
     };
 
     static Params
@@ -400,7 +410,7 @@ struct CollectiveEpilogueBwdGQA {
         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
-                args.cu_seqlens, args.seqused};
+                args.cu_seqlens, args.seqused, args.dsink_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -416,7 +426,8 @@ struct CollectiveEpilogueBwdGQA {
           SharedStorage& shared_storage,
           TiledMma tiled_mma,
           int thread_idx,
-          cute::tuple<int32_t, int32_t, int32_t> const& block_coord
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord,
+          float dsink_val=0.0f
           ) {
 
         auto [n_block, bidh, bidb] = block_coord;
@@ -506,6 +517,10 @@ struct CollectiveEpilogueBwdGQA {
             static_assert(CUTE_STATIC_V(size(tdKrdK_atomic)) == CUTE_STATIC_V(size(tdKgdK_atomic)));
             #pragma unroll
             for (int i = 0; i < size(tdKrdK_atomic); ++i) { atomicAdd(&tdKgdK_atomic(i), tdKrdK_atomic(i)); }
+        }
+        if constexpr (Has_sink) {
+            float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
+            atomicAdd(dsink_ptr + bidh, -dsink_val);
         }
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);

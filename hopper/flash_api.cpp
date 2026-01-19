@@ -1053,6 +1053,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);
         params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.pack_gqa = false; // Disable pack_gqa if learnable sink is provided
     } else {
         params.learnable_sink_ptr = nullptr;
     }
