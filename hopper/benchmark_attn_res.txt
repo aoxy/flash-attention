@@ -1,0 +1,16 @@
+
+### headdim = 128, causal = False, seqlen = 8192 ###
+Fav2 fwd: 2.798ms, 393.0 TFLOPS
+Fav2 bwd: 9.343ms, 294.2 TFLOPS
+CuDNN fwd: 1.692ms, 649.7 TFLOPS
+CuDNN bwd: 4.985ms, 551.4 TFLOPS
+Fav3 fwd: 1.570ms, 700.4 TFLOPS
+Fav3 bwd: 4.320ms, 636.3 TFLOPS
+
+### headdim = 128, causal = True, seqlen = 8192 ###
+Fav2 fwd: 1.580ms, 348.0 TFLOPS
+Fav2 bwd: 4.605ms, 298.4 TFLOPS
+CuDNN fwd: 0.927ms, 593.0 TFLOPS
+CuDNN bwd: 2.840ms, 483.9 TFLOPS
+Fav3 fwd: 0.804ms, 684.0 TFLOPS
+Fav3 bwd: 2.336ms, 588.4 TFLOPS
