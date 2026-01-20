@@ -172,6 +172,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_k,
         params.seqused_k,
         reinterpret_cast<float *>(params.dsink_ptr),
+        params.b,
     };
 
     int num_blocks_n = cutlass::ceil_div(params.seqlen_k, get<1>(TileShape_MNK{}));

@@ -42,6 +42,7 @@ public:
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
     static constexpr bool dKV_swapAB = CollectiveMainloop::dKV_swapAB;
+    static constexpr bool Has_sink = CollectiveMainloop::Has_sink;
 
     // Epilogue derived types
     using CollectiveEpilogue = CollectiveEpilogue_;
@@ -68,6 +69,9 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = 40;
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
+    static constexpr uint32_t SinkHeads = 24; // 24 is the maximum number of heads that can be processed in a single block?
+    using TensorDSink = std::conditional_t<Has_sink, cute::array<float, SinkHeads>, cute::array<float, 0>>;
+
     // Kernel level shared memory storage
     struct SharedStorage {
         struct TensorStorage : cute::aligned_struct<128> {
@@ -84,6 +88,7 @@ public:
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
+        TensorDSink dsink_h_sum;
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -198,6 +203,14 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
+        if constexpr (Has_sink) {
+            Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
+            Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
+            if (threadIdx.x < SinkHeads) {
+                dsink_h_sum(threadIdx.x) = 0.f;
+            }
+        }
+
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
             cute::cluster_arrive_relaxed();
@@ -273,7 +286,7 @@ public:
                 }
 
             }
-            epilogue.store_tail();
+            epilogue.store_tail(params.epilogue, shared_storage, threadIdx.x - NumCopyThreads);
         }
 
     }

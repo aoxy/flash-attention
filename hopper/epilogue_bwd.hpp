@@ -29,6 +29,7 @@ struct CollectiveEpilogueBwd {
     static constexpr bool Varlen = Varlen_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
     static constexpr bool Use_TMA = !Varlen && ArchTag::kMinComputeCapability >= 90;
+    static constexpr uint32_t SinkHeads = 24;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -115,6 +116,7 @@ struct CollectiveEpilogueBwd {
         int const* cu_seqlens;
         int const* seqused;
         float* dsink_ptr;
+        int const batch_size;
     };
 
     // Device side kernel params
@@ -129,6 +131,8 @@ struct CollectiveEpilogueBwd {
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
         float* dsink_ptr;
+        int const num_heads_q;
+        int const batch_size;
     };
 
     static Params
@@ -150,7 +154,7 @@ struct CollectiveEpilogueBwd {
             }
         }();
         return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.shape_dV, args.stride_dV,
-                tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused, args.dsink_ptr};
+                tma_store_dK, tma_store_dV, args.cu_seqlens, args.seqused, args.dsink_ptr, args.num_heads_q, args.batch_size};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -272,14 +276,34 @@ struct CollectiveEpilogueBwd {
         }
 
         if constexpr (Has_sink) {
-            float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
-            atomicAdd(dsink_ptr + bidh, -dsink_val);
+            SumOp<float> sum_op;
+            dsink_val = Allreduce<32>::run(dsink_val, sum_op);
+            if (thread_idx % 32 == 0) {
+                if (dsink_val != 0.0f) {
+                    Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
+                    Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
+                    atomicAdd(&dsink_h_sum(bidh), -dsink_val);
+                }
+            }
         }
     }
 
+    template <typename SharedStorage>
     CUTLASS_DEVICE void
-    store_tail() {
-        // if constexpr (Use_TMA) { tma_store_wait<0>(); }
+    store_tail(Params const& params,
+              SharedStorage& shared_storage,
+              int thread_idx
+              ) {
+        if constexpr (Has_sink) {
+            if (thread_idx < SinkHeads) {
+                Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
+                Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
+                float local_sum = dsink_h_sum(thread_idx);
+                if (local_sum != 0.0f) {
+                    atomicAdd(params.dsink_ptr + thread_idx, local_sum);
+                }
+            }
+        }
     }
 
     // Write 0 to dK and dV
@@ -335,6 +359,7 @@ struct CollectiveEpilogueBwdGQA {
     static constexpr int NumEpilogueThreads = NumEpilogueThreads_;
     static constexpr bool Varlen = Varlen_;
     static constexpr bool Use_TMA = ArchTag::kMinComputeCapability >= 90;
+    static constexpr uint32_t SinkHeads = 24;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -383,6 +408,7 @@ struct CollectiveEpilogueBwdGQA {
         int const* cu_seqlens;
         int const* seqused;
         float* dsink_ptr;
+        int const batch_size;
     };
 
     // Device side kernel params
@@ -399,6 +425,8 @@ struct CollectiveEpilogueBwdGQA {
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
         float* dsink_ptr;
+        int const num_heads_q;
+        int const batch_size;
     };
 
     static Params
@@ -410,7 +438,7 @@ struct CollectiveEpilogueBwdGQA {
         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
-                args.cu_seqlens, args.seqused, args.dsink_ptr};
+                args.cu_seqlens, args.seqused, args.dsink_ptr, args.num_heads_q, args.batch_size};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -519,8 +547,16 @@ struct CollectiveEpilogueBwdGQA {
             for (int i = 0; i < size(tdKrdK_atomic); ++i) { atomicAdd(&tdKgdK_atomic(i), tdKrdK_atomic(i)); }
         }
         if constexpr (Has_sink) {
-            float* dsink_ptr = reinterpret_cast<float*>(params.dsink_ptr);
-            atomicAdd(dsink_ptr + bidh, -dsink_val);
+            SumOp<float> sum_op;
+            dsink_val = Allreduce<32>::run(dsink_val, sum_op);
+            if (thread_idx % 32 == 0) {
+                if (dsink_val != 0.0f) {
+                    Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
+                    Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
+                    atomicAdd(&dsink_h_sum(bidh), -dsink_val);
+                }
+            }
+            
         }
         if constexpr (Deterministic) {
             Barrier::arrive_inc(lock_ptr, thread_idx, n_block * num_batch * num_head_kv);
@@ -529,8 +565,22 @@ struct CollectiveEpilogueBwdGQA {
         // flash::named_barrier_arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::KVEmpty) /*id*/);
     }
 
+    template <typename SharedStorage>
     CUTLASS_DEVICE void
-    store_tail() {
+    store_tail(Params const& params,
+              SharedStorage& shared_storage,
+              int thread_idx
+              ) {
+        if constexpr (Has_sink) {
+            if (thread_idx < SinkHeads) {
+                Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
+                Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
+                float local_sum = dsink_h_sum(thread_idx);
+                if (local_sum != 0.0f) {
+                    atomicAdd(params.dsink_ptr + thread_idx, local_sum);
+                }
+            }
+        }
     }
 
     // Write 0 to dK and dV
