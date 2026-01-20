@@ -153,8 +153,6 @@ struct Softmax {
             float sum = row_sum(mi);
             if constexpr (Has_sink) {
                 static constexpr float max_offset = float(Max_offset);
-                // const float max_scaled = row_max(mi) == -INFINITY ? 0.f : row_max(mi) * softmax_scale;
-                // sum += exp2f(sink_val * float(M_LOG2E) - max_scaled);
                 const float max_scaled = max(mi) == -INFINITY ? 0.f : (row_max(mi) * softmax_scale_log2) - max_offset;
                 sum += exp2f(sink_val * float(M_LOG2E) - max_scaled);
             }

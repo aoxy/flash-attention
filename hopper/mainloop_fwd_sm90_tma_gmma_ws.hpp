@@ -613,8 +613,6 @@ struct CollectiveMainloopFwdSm90 {
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
-        // shared_storage.sink_val = !Has_sink ? -INFINITY : params.ptr_Sink[bidh];
-
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
                 scheduler_prefetch();

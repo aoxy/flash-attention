@@ -170,10 +170,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
     dim3 block_dims = AttnKernel::get_block_shape();
     int smem_size = AttnKernel::SharedStorageSize;
-    int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
-    int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
-    int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
-    // printf("========== smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
+    // int smem_size_q = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_q));
+    // int smem_size_k = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_k));
+    // int smem_size_v = sizeof(decltype((typename CollectiveMainloop::TensorStorage{}).smem_v));
+    // printf("smem_size = %d, q = %d, k = %d, v = %d\n", smem_size, smem_size_q, smem_size_k, smem_size_v);
     // Get the ptr to kernel function.
     if constexpr (size(ClusterShape{}) > 1) {
         void const* kernel = (void const*) cutlass::device_kernel<AttnKernel>;
@@ -212,12 +212,12 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                     static constexpr bool HasQv = HasQV_ && Arch == 90 && !Is_FP8 && kHeadDim == 64 && kHeadDimV >= 256;
                     APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                         SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
-                        static constexpr bool PackGQA_Sink = PackGQA && !Has_sink;
-                        // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                        CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                            static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                            run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink && !Split>(params, stream);
-                        });
+                            static constexpr bool PackGQA_Sink = PackGQA && !Has_sink;
+                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
+                            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                                static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink && !Split>(params, stream);
+                            });
                         });
                     });
                 });

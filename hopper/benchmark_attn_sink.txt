@@ -1,0 +1,40 @@
+
+### headdim = 128, causal = False, seqlen = 4096, nheads = 24, nheads_kv = 2 ###
+Fav2 fwd: 1.072ms, 384.5 TFLOPS
+Fav2 bwd: 3.610ms, 285.6 TFLOPS
+CuDNN fwd: 0.638ms, 646.1 TFLOPS
+CuDNN bwd: 2.000ms, 515.4 TFLOPS
+Fav3 fwd: 0.970ms, 425.1 TFLOPS
+Fav3Sink fwd: 0.971ms, 425.1 TFLOPS
+Fav3 bwd: 4.526ms, 227.8 TFLOPS
+Fav3Sink bwd: 5.617ms, 183.5 TFLOPS
+
+### headdim = 128, causal = True, seqlen = 4096, nheads = 24, nheads_kv = 2 ###
+Fav2 fwd: 0.633ms, 325.4 TFLOPS
+Fav2 bwd: 1.963ms, 262.5 TFLOPS
+CuDNN fwd: 0.370ms, 557.4 TFLOPS
+CuDNN bwd: 1.259ms, 409.2 TFLOPS
+Fav3 fwd: 0.503ms, 410.2 TFLOPS
+Fav3Sink fwd: 0.503ms, 410.2 TFLOPS
+Fav3 bwd: 2.432ms, 211.9 TFLOPS
+Fav3Sink bwd: 2.922ms, 176.4 TFLOPS
+
+### headdim = 256, causal = False, seqlen = 4096, nheads = 24, nheads_kv = 2 ###
+Fav2 fwd: 2.451ms, 336.5 TFLOPS
+Fav2 bwd: 8.963ms, 230.0 TFLOPS
+CuDNN fwd: 1.191ms, 692.3 TFLOPS
+CuDNN bwd: 6.106ms, 337.6 TFLOPS
+Fav3 fwd: 1.082ms, 762.3 TFLOPS
+Fav3Sink fwd: 1.083ms, 762.3 TFLOPS
+Fav3 bwd: 4.590ms, 449.2 TFLOPS
+Fav3Sink bwd: 5.750ms, 358.5 TFLOPS
+
+### headdim = 256, causal = True, seqlen = 4096, nheads = 24, nheads_kv = 2 ###
+Fav2 fwd: 1.341ms, 307.5 TFLOPS
+Fav2 bwd: 4.384ms, 235.1 TFLOPS
+CuDNN fwd: 0.679ms, 606.8 TFLOPS
+CuDNN bwd: 3.185ms, 323.7 TFLOPS
+Fav3 fwd: 0.571ms, 722.3 TFLOPS
+Fav3Sink fwd: 0.571ms, 722.3 TFLOPS
+Fav3 bwd: 2.521ms, 408.8 TFLOPS
+Fav3Sink bwd: 2.977ms, 346.2 TFLOPS
