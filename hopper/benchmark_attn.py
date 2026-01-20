@@ -280,7 +280,7 @@ for headdim in [128, 256]:
         k = torch.randn(batch_size, seqlen, nheads_kv, headdim, device=device, dtype=dtype_gen, requires_grad=True)
         v = torch.randn(batch_size, seqlen, nheads_kv, headdim_v, device=device, dtype=dtype_gen, requires_grad=True)
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in [q, k, v]]
-        sink = torch.randn((nheads,), dtype=torch.float32, device=device, requires_grad=True)
+        sink = torch.randn((nheads,), dtype=dtype_gen, device=device, requires_grad=True)
         v_colmajor = v.detach().transpose(-1, -3).contiguous().transpose(-1, -3).requires_grad_()
         v_fa3 = v if not V_colmajor else v_colmajor
         qv = torch.randn(batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype_gen) if has_qv else None

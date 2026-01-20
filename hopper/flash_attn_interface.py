@@ -62,6 +62,7 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
+    learnable_sink = None if learnable_sink is None else learnable_sink.float()
     out, softmax_lse, *rest = flash_attn_3_cuda.fwd(
         q,
         k,
@@ -129,6 +130,9 @@ def _flash_attn_backward(
 ):
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    dsink_dtype = None if dsink is None else dsink.dtype
+    learnable_sink = None if learnable_sink is None else learnable_sink.float()
+    dsink = None if dsink is None else dsink.float()
     dq, dk, dv, softmax_d, dsink, *rest = flash_attn_3_cuda.bwd(
         dout,
         q,
@@ -155,7 +159,7 @@ def _flash_attn_backward(
         learnable_sink,
         dsink,
     )
-    return dq, dk, dv, softmax_d, dsink
+    return dq, dk, dv, softmax_d, (None if dsink is None else dsink.to(dsink_dtype))
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
