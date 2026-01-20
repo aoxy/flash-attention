@@ -69,7 +69,7 @@ public:
     // static constexpr uint32_t LoadRegisterRequirement = 40;
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
 
-    static constexpr uint32_t SinkHeads = 24; // 24 is the maximum number of heads that can be processed in a single block?
+    static constexpr uint32_t SinkHeads = 32; // Padded to avoid shared memory bank conflicts. Original max heads: 24.
     using TensorDSink = std::conditional_t<Has_sink, cute::array<float, SinkHeads>, cute::array<float, 0>>;
 
     // Kernel level shared memory storage
@@ -88,7 +88,8 @@ public:
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
         } pipelines;
 
-        TensorDSink dsink_h_sum;
+        // TensorDSink dsink_h_sum;
+        float dsink_warp_acc[SinkHeads][NumMmaWarpGroups * cutlass::NumWarpsPerWarpGroup];
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -203,13 +204,12 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-        if constexpr (Has_sink) {
-            Layout smem_layout = make_layout(make_shape(Int<SinkHeads>{}));
-            Tensor dsink_h_sum = make_tensor(make_smem_ptr(shared_storage.dsink_h_sum.data()), smem_layout);
-            if (threadIdx.x < SinkHeads) {
-                dsink_h_sum(threadIdx.x) = 0.f;
-            }
+        int const mma_warp_idx = warp_idx - NumLoadWarpGroups * cutlass::NumWarpsPerWarpGroup;
+        int const mma_lane = (threadIdx.x - NumCopyThreads) % cutlass::NumThreadsPerWarp;
+        for (int i = mma_lane; i < SinkHeads; i+= cutlass::NumThreadsPerWarp) {
+            shared_storage.dsink_warp_acc[i][mma_warp_idx] = 0.0f;
         }
+
 
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
@@ -262,6 +262,7 @@ public:
             mainloop.mma_init();
             scheduler.init_consumer();
 
+            int thread_idx =  threadIdx.x - NumCopyThreads;
             int work_idx = 0;
             CUTLASS_PRAGMA_NO_UNROLL
             for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/false>(params.scheduler);
@@ -277,16 +278,20 @@ public:
                 float dsink_val = 0.0f;
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage, dsink_val);
+                    tdKrdK, tdVrdV, thread_idx, work_idx, block_coord, shared_storage, dsink_val);
+                SumOp<float> sum_op;
+                dsink_val = Allreduce<cutlass::NumThreadsPerWarp>::run(dsink_val, sum_op);
+                if (lane_predicate) {
+                    shared_storage.dsink_warp_acc[bidh][mma_warp_idx] += dsink_val;
+                }
                 if (tile_valid) {
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
-                                   threadIdx.x - NumCopyThreads, block_coord, dsink_val);
+                                   thread_idx, block_coord, dsink_val);
                 } else {
-                    epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
+                    epilogue.store_zero(params.epilogue, thread_idx, block_coord);
                 }
-
             }
-            epilogue.store_tail(params.epilogue, shared_storage, threadIdx.x - NumCopyThreads);
+            epilogue.store_tail<NumMmaWarpGroups * cutlass::NumWarpsPerWarpGroup>(params.epilogue, shared_storage, thread_idx);
         }
 
     }
