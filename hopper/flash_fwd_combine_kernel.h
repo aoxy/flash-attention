@@ -382,7 +382,7 @@ public:
                     } else {
                         bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
                     }
-                    const float sink_val_exp = expf((params.ptr_Sink)[bidh] - lse_max);
+                    const float sink_val_exp = expf((params.ptr_Sink)[bidh] - lse_max_cur);
                     lse_sum_cur += sink_val_exp;
                 }
             }

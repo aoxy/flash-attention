@@ -506,6 +506,8 @@ def test_flash_attn_varlen_output(
                 window_size=window_size,
                 attention_chunk=attention_chunk,
                 softcap=softcap,
+                pack_gqa=pack_gqa,
+                num_splits=num_splits,
                 learnable_sink=learnable_sink,
             )
             out = output_pad_fn(out_unpad)

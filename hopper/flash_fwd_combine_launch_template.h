@@ -62,21 +62,21 @@ void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool en
     ARCH_SWITCH(params.arch, Arch, [&] {
         BOOL_SWITCH(params.cu_seqlens_q || params.seqused_q, Varlen, [&] {
             SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
-            if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
-                if (params.num_splits <= 16) {
-                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
-                    return;
+                if constexpr (kBlockM >= 16) {  // If kBlockM == 8 then the minimum number of splits is 32.
+                    if (params.num_splits <= 16) {
+                        run_flash_fwd_combine<Arch, kBlockM, kBlockK, 4, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
+                        return;
+                    }
                 }
-            }
-            if (params.num_splits <= 32) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 5, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
-            } else if (params.num_splits <= 64) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 6, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
-            } else if (params.num_splits <= 128) {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 7, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
-            } else {
-                run_flash_fwd_combine<Arch, kBlockM, kBlockK, 8, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
-            }
+                if (params.num_splits <= 32) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 5, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
+                } else if (params.num_splits <= 64) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 6, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
+                } else if (params.num_splits <= 128) {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 7, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
+                } else {
+                    run_flash_fwd_combine<Arch, kBlockM, kBlockK, 8, false /*IsEvenK*/, Varlen, T, Tpartial, Has_sink>(params, stream, enable_pdl);
+                }
             });
         });
     });

@@ -407,7 +407,18 @@ public:
                 // If there's tanh softcap, the scaling will be done before tanh.
                 float softmax_scale_log2 = params.mainloop.softmax_scale_log2;
                 int const bidh = get<1>(block_coord);
-                float sink_val = !Has_sink ? -INFINITY : params.mainloop.ptr_Sink[bidh];
+                float sink_val = -INFINITY;
+                if constexpr (Has_sink) {
+                    if constexpr (Split && Varlen) {
+                        uint32_t num_splits_dynamic_u = reinterpret_cast<uint32_t const&>(get<3>(block_coord)) >> 16; // first 16 bits are for num_splits
+                        int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
+                        if (num_splits_dynamic <= 1) {
+                            sink_val = params.mainloop.ptr_Sink[bidh];
+                        }
+                    } else {
+                        sink_val = params.mainloop.ptr_Sink[bidh];
+                    }
+                }
                 if constexpr (Is_FP8 && !Has_softcap) {
                     int const bidh_kv = !PackGQA ? params.mainloop.qhead_per_khead_divmod.divide(bidh) : bidh;
                     float const q_descale = params.mainloop.ptr_q_descale == nullptr ? 1.0f : params.mainloop.ptr_q_descale[bidb * get<0>(params.mainloop.stride_q_descale) + bidh_kv * get<1>(params.mainloop.stride_q_descale)];
