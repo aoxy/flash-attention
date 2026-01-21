@@ -415,7 +415,6 @@ public:
                             int num_splits_dynamic = reinterpret_cast<int&>(num_splits_dynamic_u);
                             if (num_splits_dynamic <= 1) {
                                 sink_val = params.mainloop.ptr_Sink[bidh];
-                                printf("Sink val: %f, Split: %d, Varlen:%d, num_splits_dynamic: %d\n", sink_val, int(Split), int(Varlen), num_splits_dynamic);
                             }
                         }
                     } else {
