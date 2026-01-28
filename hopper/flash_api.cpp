@@ -1047,8 +1047,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
     }
 
     if (learnable_sink_.has_value()) {
-        at::Tensor learnable_sink = learnable_sink_.value();
-        TORCH_CHECK(learnable_sink.dtype() == torch::kFloat32, "Learnable sink must have dtype fp32");
+        at::Tensor learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);
@@ -1488,12 +1487,11 @@ std::vector<at::Tensor> mha_bwd(
 
 
     if (learnable_sink_.has_value()) {
-        at::Tensor learnable_sink = learnable_sink_.value();
-        TORCH_CHECK(learnable_sink.dtype() == torch::kFloat32, "Learnable sink must have dtype fp32");
+        at::Tensor learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);
-        if (dsink_.has_value()) {
+        if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
             dsink = dsink_.value();
             TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
             CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
@@ -1541,6 +1539,15 @@ std::vector<at::Tensor> mha_bwd(
     } else if (total_q > 0 && num_heads_k > 0) {
         dq.zero_();
         softmax_d.zero_();
+    }
+
+    if (learnable_sink_.has_value()) {
+        if (!dsink_.has_value()) {
+            dsink = dsink.to(learnable_sink_.value().dtype());
+        } else if (dsink_.value().dtype() != torch::kFloat32) {
+            dsink = dsink.to(dsink_.value().dtype());
+            dsink_.value().copy_(dsink);
+        }
     }
 
     return { dq, dk, dv, softmax_d, dsink, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
