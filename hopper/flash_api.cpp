@@ -1046,8 +1046,9 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
+    at::Tensor learnable_sink;
     if (learnable_sink_.has_value()) {
-        at::Tensor learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);
@@ -1485,9 +1486,9 @@ std::vector<at::Tensor> mha_bwd(
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
-
+    at::Tensor learnable_sink;
     if (learnable_sink_.has_value()) {
-        at::Tensor learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
         CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
         TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
         CHECK_SHAPE(learnable_sink, num_heads);

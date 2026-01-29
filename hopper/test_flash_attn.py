@@ -1,6 +1,7 @@
 import os
 import math
 import itertools
+import random
 
 import pytest
 import torch
@@ -136,7 +137,8 @@ def test_flash_attn_output(
         else:
             qv_ref = None
         if has_learnable_sink:
-            learnable_sink_ref = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+            sink_dtype = random.choice([torch.float32, torch.float16, torch.bfloat16])
+            learnable_sink_ref = torch.randn(nheads, device=device, dtype=sink_dtype, requires_grad=True)
             learnable_sink = learnable_sink_ref.detach().requires_grad_()
         else:
             learnable_sink_ref, learnable_sink = None, None
@@ -384,7 +386,8 @@ def test_flash_attn_varlen_output(
         else:
             qv_ref = None
         if has_learnable_sink:
-            learnable_sink_ref = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+            sink_dtype = random.choice([torch.float32, torch.float16, torch.bfloat16])
+            learnable_sink_ref = torch.randn(nheads, device=device, dtype=sink_dtype, requires_grad=True)
             learnable_sink = learnable_sink_ref.detach().requires_grad_()
         else:
             learnable_sink_ref, learnable_sink = None, None
@@ -720,7 +723,8 @@ def test_flash_attn_kvcache(
         else:
             qv = None
         if has_learnable_sink:
-            learnable_sink_ref = torch.randn(nheads, device=device, dtype=torch.float32, requires_grad=True)
+            sink_dtype = random.choice([torch.float32, torch.float16, torch.bfloat16])
+            learnable_sink_ref = torch.randn(nheads, device=device, dtype=sink_dtype, requires_grad=True)
             learnable_sink = learnable_sink_ref.detach().requires_grad_()
         else:
             learnable_sink_ref, learnable_sink = None, None
