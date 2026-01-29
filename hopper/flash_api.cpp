@@ -1493,7 +1493,6 @@ std::vector<at::Tensor> mha_bwd(
         CHECK_SHAPE(learnable_sink, num_heads);
         if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
             dsink = dsink_.value();
-            TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
             CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
             TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
             CHECK_SHAPE(dsink, num_heads);

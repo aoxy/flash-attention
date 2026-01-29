@@ -882,13 +882,14 @@ struct CollectiveMainloopBwdSm90 {
             Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
+                float dsink_val_cols = 0.0f;
                 float const dP_sum_cur = [&] {
                     if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
                     else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    if constexpr (Has_sink) { dsink_val += scores(mi, ni) * dS(mi, ni); }
+                    if constexpr (Has_sink) { dsink_val_cols += scores(mi, ni) * dS(mi, ni); }
                     dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
                 }
@@ -897,7 +898,7 @@ struct CollectiveMainloopBwdSm90 {
                         if constexpr (!ShuffleLSE) return tLSErLSE(mi);
                         else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                     }();
-                    dsink_val *= exp2f(sink_val * float(M_LOG2E) - lse_scaled);
+                    dsink_val += dsink_val_cols * exp2f(sink_val * float(M_LOG2E) - lse_scaled);
                 }
             }
 

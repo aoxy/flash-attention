@@ -256,7 +256,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             dsink,
         )
         dqkv = dqkv[..., : dout.shape[-1]]  # We could have padded the head dimension
-        return dqkv, None, None, None, None, None, None, None, None, None, None, dsink, None
+        return dqkv, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -348,7 +348,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -455,7 +455,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 def flash_attn_qkvpacked_func(
