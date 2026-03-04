@@ -1,8 +1,11 @@
 #!/bin/bash
 set -e
 
+# I don't have any SM8x-based GPU hardware, so I haven't developed support for it yet.
 export FLASH_ATTENTION_DISABLE_SM80="TRUE"
+# Compiling it takes too much time; it might work, but I haven't tested it myself.
 export FLASH_ATTENTION_DISABLE_FP8="TRUE"
+
 # export FLASH_ATTENTION_DISABLE_SOFTCAP="TRUE"
 # export FLASH_ATTENTION_DISABLE_LOCAL="TRUE"
 # export FLASH_ATTENTION_DISABLE_BACKWARD="TRUE"
