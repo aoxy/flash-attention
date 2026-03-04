@@ -200,7 +200,6 @@ public:
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
 
-
         // We need this to guarantee that the Pipeline init is visible to all producers and consumer blocks in the Cluster
         if constexpr (size(ClusterShape{}) > 1) {
             cute::cluster_arrive_relaxed();

@@ -459,6 +459,7 @@ def _backward(ctx, dout, *grads):
 _flash_attn_forward.register_autograd(_backward, setup_context=setup_context)
 
 
+
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -654,7 +655,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -764,7 +765,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, dsink
 
 
 def flash_attn_qkvpacked_func(
