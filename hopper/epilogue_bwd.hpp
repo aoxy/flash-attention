@@ -109,6 +109,7 @@ struct CollectiveEpilogueBwd {
         Element* ptr_dV;
         ShapedKV const shape_dV;
         StridedKV const stride_dV;
+        int const num_batch;
         int const num_heads_q;
         int* dk_semaphore;
         int* dv_semaphore;
@@ -380,7 +381,8 @@ struct CollectiveEpilogueBwdGQA {
         ElementAccum* ptr_dVaccum;
         ShapedKV const shape_dVaccum;
         StridedKV const stride_dVaccum;
-        int num_heads_q;
+        int const num_batch;
+        int const num_heads_q;
         int* dk_semaphore;
         int* dv_semaphore;
         int const* cu_seqlens;
@@ -399,6 +401,7 @@ struct CollectiveEpilogueBwdGQA {
         cutlass::FastDivmod qhead_per_khead_divmod;
         int* dk_semaphore;
         int* dv_semaphore;
+        int const num_batch;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
         float* dsink_ptr;
@@ -413,7 +416,7 @@ struct CollectiveEpilogueBwdGQA {
         return {args.ptr_dKaccum, args.shape_dKaccum, args.stride_dKaccum, args.ptr_dVaccum, args.shape_dVaccum, args.stride_dVaccum,
                 cutlass::FastDivmod(cute::ceil_div(args.num_heads_q, get<1>(args.shape_dKaccum))),
                 args.dk_semaphore, args.dv_semaphore,
-                args.cu_seqlens, args.seqused, args.dsink_ptr};
+                args.num_batch, args.cu_seqlens, args.seqused, args.dsink_ptr};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -463,8 +466,8 @@ struct CollectiveEpilogueBwdGQA {
             cute::copy(r2s_tiled_copy_dKVaccum, taccdKVrdV, tdKVsdKVaccum);
         }
 
-        // int const num_batch = params.num_batch;
-        int const num_batch = get<2>(params.shape_dKaccum);
+        int const num_batch = params.num_batch;
+        // int const num_batch = get<2>(params.shape_dKaccum); // erroneously returns 1 for varlen
         int const num_head_kv = get<1>(params.shape_dKaccum);
         int *lock_ptr = !Deterministic ? nullptr : params.dv_semaphore + bidb * num_head_kv + bidh_kv;
         using Barrier = cutlass::GenericBarrier<cutlass::detail::SyncwarpSync>;
