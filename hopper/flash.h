@@ -160,6 +160,7 @@ struct Flash_fwd_params : public Qkv_params {
     int arch;
     int num_sm;
     void *__restrict__ learnable_sink_ptr;
+    bool use_fa4_sink;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -398,6 +398,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         float const* const ptr_Sink = nullptr;
+        bool const use_fa4_sink = false;
     };
 
     // Device side kernel params
@@ -456,6 +457,7 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
         float const* const ptr_Sink = nullptr;
+        bool const use_fa4_sink = false;
     };
 
     static Params
@@ -567,7 +569,7 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_Sink};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_Sink, args.use_fa4_sink};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance

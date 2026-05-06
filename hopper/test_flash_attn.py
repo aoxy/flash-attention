@@ -216,6 +216,7 @@ def test_flash_attn_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 learnable_sink=learnable_sink,
+                use_fa4_sink=True,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -512,6 +513,7 @@ def test_flash_attn_varlen_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 learnable_sink=learnable_sink,
+                use_fa4_sink=True,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -952,6 +954,7 @@ def test_flash_attn_kvcache(
                     num_splits=num_splits,
                     return_softmax_lse=True,
                     learnable_sink=learnable_sink,
+                    use_fa4_sink=True,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)

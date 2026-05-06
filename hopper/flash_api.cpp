@@ -681,7 +681,8 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         int num_splits,
         std::optional<bool> pack_gqa_,
         int const sm_margin,
-        std::optional<const at::Tensor> learnable_sink_
+        std::optional<const at::Tensor> learnable_sink_,
+        bool use_fa4_sink
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1054,6 +1055,7 @@ mha_fwd(at::Tensor &q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seq
         CHECK_SHAPE(learnable_sink, num_heads);
         params.learnable_sink_ptr = learnable_sink.data_ptr();
         params.pack_gqa = false; // Disable pack_gqa if learnable sink is provided
+        params.use_fa4_sink = use_fa4_sink;
     } else {
         params.learnable_sink_ptr = nullptr;
     }

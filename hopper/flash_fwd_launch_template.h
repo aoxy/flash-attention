@@ -127,7 +127,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
         params.leftpad_k, params.seqlens_rotary,
-        reinterpret_cast<float const*>(params.learnable_sink_ptr)
+        reinterpret_cast<float const*>(params.learnable_sink_ptr), params.use_fa4_sink
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),

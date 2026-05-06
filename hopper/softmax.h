@@ -97,9 +97,10 @@ struct Softmax {
     float const softmax_scale_log2;
     float const softmax_scale;
     float const sink_val;
+    bool const use_fa4_sink;
 
-    CUTLASS_DEVICE Softmax(float const softmax_scale_log2_, float const sink_val_ = -INFINITY)
-        : softmax_scale_log2(softmax_scale_log2_), softmax_scale(softmax_scale_log2_ * float(M_LN2)), sink_val(sink_val_) {};
+    CUTLASS_DEVICE Softmax(float const softmax_scale_log2_, float const sink_val_ = -INFINITY, bool const use_fa4_sink_ = false)
+        : softmax_scale_log2(softmax_scale_log2_), softmax_scale(softmax_scale_log2_ * float(M_LN2)), sink_val(sink_val_), use_fa4_sink(use_fa4_sink_) {};
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) {
@@ -109,10 +110,14 @@ struct Softmax {
         TensorT scores_scale;
         if constexpr (Is_first) {
             if constexpr (Has_sink) {
-                const float sink_scaled = sink_val / softmax_scale;
-                #pragma unroll
-                for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_scaled; }
-                flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+                if (use_fa4_sink) {
+                    flash::template reduce_max</*zero_init=*/true>(scores, row_max);
+                } else {
+                    const float sink_scaled = sink_val / softmax_scale;
+                    #pragma unroll
+                    for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_scaled; }
+                    flash::template reduce_max</*zero_init=*/false>(scores, row_max);
+                }
             } else {
                 flash::template reduce_max</*zero_init=*/true>(scores, row_max);
             }
@@ -153,7 +158,7 @@ struct Softmax {
             float sum = row_sum(mi);
             if constexpr (Has_sink) {
                 static constexpr float max_offset = float(Max_offset);
-                const float max_scaled = max(mi) == -INFINITY ? 0.f : (row_max(mi) * softmax_scale_log2) - max_offset;
+                const float max_scaled = row_max(mi) == -INFINITY ? 0.f : (row_max(mi) * softmax_scale_log2) - max_offset;
                 sum += exp2f(sink_val * float(M_LOG2E) - max_scaled);
             }
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
