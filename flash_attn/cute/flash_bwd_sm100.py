@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 import math
+import operator
 from typing import Callable, Optional
 from functools import partial
 
@@ -460,6 +461,8 @@ class FlashAttentionBackwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -1001,6 +1004,8 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            learnable_sink,
+            mdSink,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1074,6 +1079,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1596,6 +1603,8 @@ class FlashAttentionBackwardSm100:
                 aux_tensors,
                 fastdiv_mods,
                 blocksparse_tensors,
+                learnable_sink,
+                mdSink,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2857,6 +2866,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -2971,6 +2982,15 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            # Per-work-tile sink-gradient accumulator (per (n_block, head_idx)).
+            dsink_acc = None
+            sink_log2 = None
+            if const_expr(learnable_sink is not None):
+                dsink_acc = cute.make_fragment(cute.make_layout(1), Float32)
+                dsink_acc[0] = Float32(0.0)
+                sink_log2 = (
+                    Float32(learnable_sink[head_idx]) * Float32(math.log2(math.e))
+                )
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -3102,6 +3122,10 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                # Per-Q-tile sink factor cache (one Float32 per S element across all stages).
+                tSrFactor = None
+                if const_expr(learnable_sink is not None):
+                    tSrFactor = cute.make_fragment(tScS_t2r.shape, Float32)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3118,6 +3142,13 @@ class FlashAttentionBackwardSm100:
                             lse_pair = (
                                 utils.shuffle_sync(tSrLSE, offset=2 * v),
                                 utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            )
+                        if const_expr(learnable_sink is not None):
+                            tSrFactor[2 * v, stage, 0, 0] = cute.math.exp2(
+                                sink_log2 - lse_pair[0], fastmath=True
+                            )
+                            tSrFactor[2 * v + 1, stage, 0, 0] = cute.math.exp2(
+                                sink_log2 - lse_pair[1], fastmath=True
                             )
                         tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
                             ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
@@ -3168,6 +3199,13 @@ class FlashAttentionBackwardSm100:
                     self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                    # Accumulate sink gradient: sum_{m,k in tile} P * dP_raw * exp2(sink - lse[m]).
+                    # Must be done BEFORE we overwrite tdPrdP_cur with dS = P * (dP - dpsum).
+                    if const_expr(learnable_sink is not None):
+                        for i in cutlass.range_constexpr(cute.size(tdPrdP_cur)):
+                            dsink_acc[0] = dsink_acc[0] + (
+                                tSrS_cur[i] * tdPrdP_cur[i] * tSrFactor[i, stage, 0, 0]
+                            )
                     tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
                     if const_expr(not self.shuffle_dPsum):
                         tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
@@ -3289,6 +3327,14 @@ class FlashAttentionBackwardSm100:
                             stage_copy_bytes,
                             peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
                         )
+
+            # Reduce per-warp dsink_acc and atomic-add into mdSink[head_idx].
+            if const_expr(learnable_sink is not None):
+                dsink_val = utils.warp_reduce(dsink_acc[0], operator.add)
+                if cute.arch.lane_idx() == 0 and dsink_val != Float32(0.0):
+                    utils.atomic_add_fp32(
+                        -dsink_val, utils.elem_pointer(mdSink, (head_idx,))
+                    )
 
             # Final signal for dS smem store completion
             if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):

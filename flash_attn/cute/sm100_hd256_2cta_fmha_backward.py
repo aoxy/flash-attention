@@ -129,7 +129,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
-        assert not is_local, "SM100 backward with head_dim=256 does not support local attention"
         assert tile_m_dq == 128 and tile_n_dq == 128, (
             "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
         )
@@ -152,12 +151,12 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
         self.acc_dtype = cutlass.Float32
         self.is_causal = is_causal
-        self.window_size_left = (
-            None if (window_size_left is None or window_size_left < 0) else window_size_left
-        )
-        self.window_size_right = (
-            None if (window_size_right is None or window_size_right < 0) else window_size_right
-        )
+        self.is_local = is_local
+        # Pass window sizes through literally (mirroring forward semantics);
+        # only None means "no limit". Negative integers are treated as literal
+        # window sizes by the mask logic.
+        self.window_size_left = window_size_left
+        self.window_size_right = window_size_right
         self.tile_m_dq = tile_m_dq
         self.tile_n_dq = tile_n_dq
         self.tile_m_dkdv = tile_m_dkdv
@@ -202,6 +201,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
         seqused_k: cute.Tensor | None = None,
         window_size_left: Int32 | None = None,
         window_size_right: Int32 | None = None,
+        learnable_sink: cute.Tensor | None = None,
+        mdSink: cute.Tensor | None = None,
         dQ_semaphore: cute.Tensor | None = None,
         dK_semaphore: cute.Tensor | None = None,
         dV_semaphore: cute.Tensor | None = None,
@@ -291,4 +292,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_k,
             scale_softmax,
             stream,
+            learnable_sink=learnable_sink,
+            mdSink=mdSink,
         )

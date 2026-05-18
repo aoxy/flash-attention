@@ -187,22 +187,16 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert mSeqUsedQ is None and mSeqUsedK is None, (
             "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
         )
-        assert learnable_sink is None, (
-            "SM100 forward with head_dim=256 does not support learnable_sink"
-        )
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
         assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
-        assert not self.is_local, (
-            "SM100 forward with head_dim=256 does not support local attention yet"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 forward with head_dim=256 does not support runtime window_size overrides"
-        )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
+
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
+        window_size_right = Int32(window_size_right) if window_size_right is not None else None
 
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
         lse_tensor = mLSE
@@ -535,6 +529,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             max_seqlen_k_paged,
             window_size_left,
             window_size_right,
+            learnable_sink,
             self.cluster_layout_vmnk,
             q_smem_layout_staged,
             k_smem_layout_staged,
@@ -572,6 +567,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         max_seqlen_k: Optional[Int32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
+        learnable_sink: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         q_smem_layout_staged: cute.ComposedLayout,
         k_smem_layout_staged: cute.ComposedLayout,
@@ -1350,6 +1346,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
                         if cutlass.const_expr(self.use_semantic_trip_range):
+                            # Mask is needed when the step falls in the
+                            # causal/local masked region OR when it is the
+                            # final K tile (residual seqlen out-of-bound).
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
                                 or step < n_block_min_before_local_mask
@@ -1389,6 +1388,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cum_seqlen_q,
                         cuseqlen_q,
                         scale_softmax,
+                        scale_softmax_log2,
+                        learnable_sink,
                     )
                 work_tile = tile_sched.advance_to_next_work()
             p_mma_producer.tail()
@@ -1854,9 +1855,22 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_q,
         cuseqlen_q,
         scale_softmax,
+        scale_softmax_log2,
+        learnable_sink: Optional[cute.Tensor],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
+        if cutlass.const_expr(learnable_sink is not None):
+            head_idx = current_block_coord[2][0]
+            sink_val = Float32(learnable_sink[head_idx])
+            LOG2_E = Float32(math.log2(math.e))
+            if row_max == -Float32.inf:
+                row_max = sink_val * (LOG2_E / scale_softmax_log2)
+                row_sum = 1.0
+            else:
+                row_sum += cute.math.exp2(
+                    sink_val * LOG2_E - row_max * scale_softmax_log2, fastmath=True
+                )
         sum_handle = sum_producer.acquire_and_advance()
         sSum[thread_idx] = row_sum
         cute.arch.fence_view_async_shared()

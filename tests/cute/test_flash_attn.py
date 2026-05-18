@@ -147,10 +147,6 @@ def test_flash_attn_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
@@ -219,14 +215,14 @@ def test_flash_attn_output(
             (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
         )
         if local_enum == 2:
-            window_size = (None, -window_size[1])
+            window_size = (None, window_size[1])
         elif local_enum == 3:
-            window_size = (-window_size[0], None)
+            window_size = (window_size[0], None)
         if local:
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device).requires_grad_()
         else:
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -353,7 +349,6 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256)
             )
-            and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -363,7 +358,7 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g, retain_graph=has_learnable_sink)
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
                 # skip data-dependent postprocessing
@@ -382,9 +377,9 @@ def test_flash_attn_output(
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
             dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
+                out_ref, (q_ref, k_ref, v_ref), g, retain_graph=has_learnable_sink
             )
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g, retain_graph=has_learnable_sink)
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
             print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -436,14 +431,31 @@ def test_flash_attn_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
+            if has_learnable_sink:
+                (dsink,) = torch.autograd.grad(out, learnable_sink, g)
+                (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
+                (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+                print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+                print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+                print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+                print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
+                if VERBOSE:
+                    diff_dsink = (dsink - dsink_ref).abs()
+                    max_idx = diff_dsink.argmax()
+                    coords = torch.unravel_index(max_idx, diff_dsink.shape)
+                    print(f"dSink max diff: {diff_dsink.max().item()}")
+                    print(f"  at coordinates {tuple(c.item() for c in coords)}: dSink={dsink[coords].item()}, dSink_ref={dsink_ref[coords].item()}")
+                dsink_atol = 2 * (dsink_ref + 0.3 - 0.3 - dsink_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+                assert (dsink - dsink_ref).abs().max().item() <= rtol * (dsink_pt - dsink_ref).abs().max().item() + dsink_atol
+
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -541,10 +553,6 @@ def test_flash_attn_varlen_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
@@ -618,7 +626,7 @@ def test_flash_attn_varlen_output(
         if local:
             print("window size = ", window_size)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device).requires_grad_()
         else:
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -835,7 +843,6 @@ def test_flash_attn_varlen_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256)
             )
-            and not has_learnable_sink
             and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
             # and False
         ):
@@ -875,7 +882,8 @@ def test_flash_attn_varlen_output(
                     k_unpad if unpad_kv else k,
                     v_unpad if unpad_kv else v,
                 ),
-                g_unpad
+                g_unpad,
+                retain_graph=has_learnable_sink
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -911,9 +919,9 @@ def test_flash_attn_varlen_output(
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
             dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
+                out_ref, (q_ref, k_ref, v_ref), g, retain_graph=has_learnable_sink
             )
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g, retain_graph=has_learnable_sink)
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
             print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -963,6 +971,22 @@ def test_flash_attn_varlen_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
+            if has_learnable_sink:
+                (dsink,) = torch.autograd.grad(out_unpad, learnable_sink, g_unpad)
+                (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
+                (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+                print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
+                print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
+                print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
+                print(f"dSink Pytorch mean diff: {(dsink_pt - dsink_ref).abs().mean().item()}")
+                if VERBOSE:
+                    diff_dsink = (dsink - dsink_ref).abs()
+                    max_idx = diff_dsink.argmax()
+                    coords = torch.unravel_index(max_idx, diff_dsink.shape)
+                    print(f"dSink max diff: {diff_dsink.max().item()}")
+                    print(f"  at coordinates {tuple(c.item() for c in coords)}: dSink={dsink[coords].item()}, dSink_ref={dsink_ref[coords].item()}")
+                dsink_atol = 2 * (dsink_ref + 0.3 - 0.3 - dsink_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
+                assert (dsink - dsink_ref).abs().max().item() <= rtol * (dsink_pt - dsink_ref).abs().max().item() + dsink_atol
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

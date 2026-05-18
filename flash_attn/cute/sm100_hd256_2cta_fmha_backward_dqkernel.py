@@ -47,18 +47,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.acc_dtype = acc_dtype
         self.mma_tiler = mma_tiler
         self.is_causal = is_causal
-        self.window_size_left = window_size_left
-        # Keep original behavior (known-good in this repo)
-        window_size_left = (
-            None
-            if (window_size_left is None or window_size_left < 0)
-            else cutlass.Int32(window_size_left)
-        )
-        window_size_right = (
-            None
-            if (window_size_right is None or window_size_right < 0)
-            else cutlass.Int32(window_size_right)
-        )
+        # Pass through literally; only None means "no limit". Negative values are
+        # treated as literal window sizes by the mask logic (mirrors fwd semantics).
+        window_size_left = None if window_size_left is None else cutlass.Int32(window_size_left)
+        window_size_right = None if window_size_right is None else cutlass.Int32(window_size_right)
         self.window_size_left = None if self.is_causal else window_size_left
         self.window_size_right = cutlass.Int32(0) if self.is_causal else window_size_right
         self.is_local = (not self.is_causal) and (
@@ -1903,9 +1895,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                         # Si, dPi -> dSi
                         if cutlass.const_expr(self.use_semantic_trip_range):
+                            # Mask is needed when the step falls in the
+                            # causal/local masked region OR when it is the
+                            # final K tile (residual seqlen out-of-bound).
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
                                 or step < n_block_min_before_local_mask
+                                or step == end_count - 1
                             )
                         else:
                             need_apply_mask = step == end_count - 1

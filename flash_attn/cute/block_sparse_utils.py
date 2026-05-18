@@ -1338,6 +1338,8 @@ def consume_block_sparse_mma_bwd_sm90(
     m_block_max: int = 0,
     aux_tensors=None,
     fastdiv_mods=(None, None),
+    dsink_acc=None,
+    sink_val_log2=None,
 ):
     """SM90 backward block sparse MMA consumption with separate partial/full loops.
 
@@ -1400,6 +1402,8 @@ def consume_block_sparse_mma_bwd_sm90(
                 score_mod_fn=score_mod_fn,
                 score_mod_bwd_fn=score_mod_bwd_fn,
                 dKV_accumulate=dKV_accumulate,
+                dsink_acc=dsink_acc,
+                sink_val_log2=sink_val_log2,
             )
             dKV_accumulate = True
 
@@ -1418,6 +1422,8 @@ def consume_block_sparse_mma_bwd_sm90(
                     score_mod_fn=score_mod_fn,
                     score_mod_bwd_fn=score_mod_bwd_fn,
                     dKV_accumulate=dKV_accumulate,
+                    dsink_acc=dsink_acc,
+                    sink_val_log2=sink_val_log2,
                 )
                 dKV_accumulate = True
 

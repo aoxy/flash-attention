@@ -1,4 +1,5 @@
 import math
+import operator
 from typing import Callable, Optional, Type
 from functools import partial
 
@@ -352,6 +353,8 @@ class FlashAttentionBackwardSm90:
         mSeqUsedK: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -611,6 +614,8 @@ class FlashAttentionBackwardSm90:
             mdV_semaphore,
             window_size_left,
             window_size_right,
+            learnable_sink,
+            mdSink,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -666,6 +671,8 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -828,6 +835,8 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                learnable_sink,
+                mdSink,
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -1135,6 +1144,8 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1321,6 +1332,15 @@ class FlashAttentionBackwardSm90:
             )
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
+            # Prepare sink gradient accumulator for this tile
+            dsink_acc = None
+            sink_val_log2 = None
+            if const_expr(learnable_sink is not None):
+                dsink_acc = cute.make_rmem_tensor(cute.make_layout(1), Float32)
+                dsink_acc[0] = Float32(0.0)
+                LOG2_E = Float32(math.log2(math.e))
+                sink_val_log2 = Float32(learnable_sink[head_idx]) * LOG2_E
+
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
@@ -1362,6 +1382,8 @@ class FlashAttentionBackwardSm90:
                             score_mod_fn=score_mod_fn_cur,
                             score_mod_bwd_fn=score_mod_bwd_fn_cur,
                             dKV_accumulate=dKV_accumulate,
+                            dsink_acc=dsink_acc,
+                            sink_val_log2=sink_val_log2,
                         )
                         dKV_accumulate = True
                 else:
@@ -1384,6 +1406,8 @@ class FlashAttentionBackwardSm90:
                         m_block_max=m_block_max,
                         aux_tensors=aux_tensors,
                         fastdiv_mods=fastdiv_mods,
+                        dsink_acc=dsink_acc,
+                        sink_val_log2=sink_val_log2,
                     )
 
                 if const_expr(self.qhead_per_kvhead == 1):
@@ -1408,6 +1432,13 @@ class FlashAttentionBackwardSm90:
                     mdK_semaphore,
                     mdV_semaphore,
                 )
+                # Atomic accumulate dsink gradient
+                if const_expr(learnable_sink is not None):
+                    dsink_val = utils.warp_reduce(dsink_acc[0], operator.add)
+                    if cute.arch.lane_idx() == 0 and dsink_val != Float32(0.0):
+                        utils.atomic_add_fp32(
+                            -dsink_val, utils.elem_pointer(mdSink, head_idx)
+                        )
             else:
                 # KV tile with zero Q blocks produces no dK/dV; write zeros.
                 if const_expr(self.use_block_sparsity or self.is_local or self.is_varlen_q):
@@ -1483,6 +1514,8 @@ class FlashAttentionBackwardSm90:
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
+        dsink_acc: Optional[cute.Tensor] = None,
+        sink_val_log2: Optional[Float32] = None,
     ):
         consumer_state_dO_cur = (
             consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
@@ -1535,8 +1568,21 @@ class FlashAttentionBackwardSm90:
         acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
             dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
-            for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
+            # Accumulate dsink: compute partial column sum of P * dP_raw, then scale by exp2(sink - lse)
+            if const_expr(dsink_acc is not None):
+                dsink_val_cols = Float32(0.0)
+                lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
+                for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                    s_val = acc_S_mn[r, c]
+                    s_dp = s_val * acc_dP_mn[r, c]
+                    dsink_val_cols += s_dp
+                    acc_dP_mn[r, c] = s_dp - s_val * dpsum_val
+                dsink_acc[0] = dsink_acc[0] + dsink_val_cols * cute.math.exp2(
+                    sink_val_log2 - lse_val, fastmath=True
+                )
+            else:
+                for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                    acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
 
         if const_expr(self.score_mod_bwd is not None):
             score_mod_bwd_fn(acc_dP, acc_S_pre, m_block=m_block)

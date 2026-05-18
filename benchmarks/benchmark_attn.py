@@ -7,7 +7,7 @@ try:
 except ImportError:
     cudnn = None
 
-from einops import rearrange
+from einops import rearrange, repeat
 
 from flash_attn.cute.bench_utils import (
     flops,
@@ -73,7 +73,13 @@ def setup_standard(ctx):
     if ctx["dtype"] == torch.float8_e4m3fn:
         return None, None
     q, k, v, g, causal = ctx["q"], ctx["k"], ctx["v"], ctx["g"], ctx["causal"]
-    fwd_fn = lambda: attention_ref(q, k, v, causal=causal)
+    # sinks = ctx["sinks"]
+    # fwd_fn = lambda: attention_ref(q, k, v, causal=causal, learnable_sink=sinks)
+    def fwd_fn():
+        k_expanded = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
+        v_expanded = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
+        return attention_ref(q, k_expanded, v_expanded, causal=causal)
+    # fwd_fn = lambda: attention_ref(q, k, v, causal=causal)
     bwd_fn = _make_bwd_fn(fwd_fn, g, [q, k, v]) if ctx["has_backward"] else None
     return fwd_fn, bwd_fn
 
@@ -115,24 +121,34 @@ def setup_cudnn(ctx):
 def setup_fa3(ctx):
     if flash_attn_func_v3 is None:
         return None, None
+    import inspect
+    _fa3_has_sink = "learnable_sink" in inspect.signature(flash_attn_func_v3).parameters
+    _fa3_varlen_has_sink = (
+        flash_attn_varlen_func_v3 is not None
+        and "learnable_sink" in inspect.signature(flash_attn_varlen_func_v3).parameters
+    )
+
     q, k, v, g, causal = ctx["q"], ctx["k"], ctx["v"], ctx["g"], ctx["causal"]
     window_size_fa, softcap = ctx["window_size_fa"], ctx["softcap"]
     num_splits, pack_gqa, deterministic = ctx["num_splits"], ctx["pack_gqa"], ctx["deterministic"]
     k_use = ctx.get("k_paged", k) if ctx["page_size"] is not None else k
     v_use = ctx.get("v_paged", v) if ctx["page_size"] is not None else v
+    sinks = ctx["sinks"]
+    sink_kwargs = {"learnable_sink": sinks} if _fa3_has_sink and sinks is not None else {}
+    sink_kwargs_varlen = {"learnable_sink": sinks} if _fa3_varlen_has_sink and sinks is not None else {}
     if ctx["varlen"]:
         qu, ku, vu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"]
         csq, csk, sq, sk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"], ctx["seqlen_q"], ctx["seqlen"]
-        fwd_fn = lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa)
+        fwd_fn = lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, **sink_kwargs_varlen)
     else:
-        fwd_fn = lambda: flash_attn_func_v3(q, k_use, v_use, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa)
+        fwd_fn = lambda: flash_attn_func_v3(q, k_use, v_use, causal=causal, window_size=window_size_fa, softcap=softcap, num_splits=num_splits, pack_gqa=pack_gqa, **sink_kwargs)
     # FA3 bwd only supports headdim == headdim_v and non-fp8
     bwd_fn = None
     if ctx["has_backward"] and ctx["dtype"] != torch.float8_e4m3fn and ctx["headdim"] == ctx["headdim_v"]:
         if ctx["varlen"]:
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=ctx["window_size"], softcap=softcap, deterministic=deterministic), g, [qu, ku, vu])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=ctx["window_size"], softcap=softcap, deterministic=deterministic, **sink_kwargs_varlen), g, [qu, ku, vu])
         else:
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_v3(q, k, v, causal=causal, softcap=softcap), g, [q, k, v])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_v3(q, k, v, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic, **sink_kwargs), g, [q, k, v])
     return fwd_fn, bwd_fn
 
 
@@ -154,7 +170,7 @@ def setup_fa4(ctx):
         csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
         pt = ctx["page_table"]
         gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
-        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices_unpad)
+        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, page_table=pt, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices_unpad)
     else:
         fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, qv=qv, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices)
     bwd_fn = None
@@ -164,19 +180,19 @@ def setup_fa4(ctx):
             qvu = ctx["qv_unpad"]
             csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
             gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices_unpad), gu, [qu, ku, vu, qvu])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, causal=causal, window_size=window_size, softcap=softcap, learnable_sink=sinks, deterministic=deterministic, gather_kv_indices=gather_kv_indices_unpad), gu, [qu, ku, vu, qvu])
         else:
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, qv=qv, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices), g, [q, k, v, qv])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, qv=qv, causal=causal, window_size=window_size, softcap=softcap, learnable_sink=sinks, deterministic=deterministic, gather_kv_indices=gather_kv_indices), g, [q, k, v, qv])
     return fwd_fn, bwd_fn
 
 
 # Ordered list of (display_name, cli_name, setup_fn)
 BACKENDS = [
+    ("FA4",      "fa4",      setup_fa4),
     ("Standard", "standard", setup_standard),
     ("FA2",      "fa2",      setup_fa2),
-    ("cuDNN",    "cudnn",    setup_cudnn),
+    # ("cuDNN",    "cudnn",    setup_cudnn),
     ("FA3",      "fa3",      setup_fa3),
-    ("FA4",      "fa4",      setup_fa4),
 ]
 
 
@@ -334,6 +350,7 @@ def parse_args():
                         help='Warmup iterations (default: 5)')
     parser.add_argument('--rep', type=int, default=10,
                         help='Repetitions per benchmark (default: 10)')
+    parser.add_argument('--sink', action='store_true', help='Run forward only')
     return parser.parse_args()
 
 
@@ -366,6 +383,7 @@ def main():
     # Parse fwd/bwd: if neither specified, do fwd only
     has_forward = args.fwd or not args.bwd
     has_backward = args.bwd
+    has_sink = args.sink
 
     # Parse causal
     if args.causal == 'true':
@@ -412,6 +430,8 @@ def main():
             nheads_kv = nheads
         has_qv = headdim == 64 and headdim_v == 512
         sinks = None
+        if has_sink:
+            sinks = torch.randn(nheads, device=device, dtype=dtype_gen)
 
         num_splits = args.num_splits
         window_size = (None, None)
@@ -481,13 +501,13 @@ def main():
                     if fwd_fn is not None and has_forward:
                         time.sleep(1.0)
                         gather_kv_str = f", gather_kv={gather_kv_eff}" if gather_kv_eff is not None else ""
-                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}")
+                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}, {has_sink=}")
                         ms = do_bench(fwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_f[cfg, display_name] = ms
                     if bwd_fn is not None and has_backward:
                         time.sleep(1.0)
                         gather_kv_str = f", gather_kv={gather_kv_eff}" if gather_kv_eff is not None else ""
-                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
+                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}, {has_sink=}")
                         ms = do_bench(bwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_b[cfg, display_name] = ms
 

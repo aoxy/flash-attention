@@ -880,6 +880,12 @@ class Sm100FusedMask:
             has_seqused_k=False,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
+        # Ensure trip count >= 1 so the LOAD/MMA pipeline (which always emits at
+        # least one Q + K0 + Vend tile) stays in lock-step with the COMPUTE
+        # warp. Empty / negative ranges arise when seqlen_q >> seqlen_k under
+        # local/causal masks (every query for this M tile is masked out). The
+        # mask itself zeros the contribution, so the dummy iteration is safe.
+        n_block_max = cutlass.max(n_block_max, n_block_min + 1)
         return n_block_min, n_block_max - n_block_min
 
     @cute.jit

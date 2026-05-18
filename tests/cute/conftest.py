@@ -69,3 +69,8 @@ def pytest_collection_finish(session):
         parent = test_counts.setdefault(item.parent.name, {})
         parent[funcname] = parent.setdefault(funcname, 0) + 1
     print(json.dumps(test_counts, indent=2))
+
+def pytest_runtest_logstart(nodeid, location):
+    print(f"\n{'='*60}")
+    print(f"▶ STARTING: {nodeid}")
+    print(f"{'='*60}", flush=True)

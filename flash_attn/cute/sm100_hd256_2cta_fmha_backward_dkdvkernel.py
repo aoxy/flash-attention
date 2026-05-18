@@ -10,6 +10,7 @@ Constraints:
 
 import enum
 import math
+import operator
 
 import cuda.bindings.driver as cuda
 
@@ -23,6 +24,7 @@ from cutlass.cute.typing import Int32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.tile_scheduler import (
     ClcState,
     SM100_TMEM_CAPACITY_COLUMNS,
@@ -144,12 +146,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         self.cluster_shape_mn = (2, 1)
         self.is_causal = is_causal
-        self.window_size_left: int = -1 if window_size_left is None else window_size_left
-        self.window_size_right: int = -1 if window_size_right is None else window_size_right
-        self.has_sliding_window = False
-        if self.window_size_left > 0 or self.window_size_right > 0:
-            self.has_sliding_window = True
+        # Treat None as "no limit". Keep negative integers as literal window
+        # sizes (mirrors fwd semantics).
+        self.has_window_left: bool = window_size_left is not None
+        self.has_window_right: bool = window_size_right is not None
+        self.window_size_left: int = 0 if window_size_left is None else window_size_left
+        self.window_size_right: int = 0 if window_size_right is None else window_size_right
+        self.has_sliding_window = self.has_window_left or self.has_window_right
         if self.is_causal:
+            self.has_window_right = True
             self.window_size_right = 0
 
         self.compute_warp_id = (0, 1, 2, 3, 4, 5, 6, 7)
@@ -217,6 +222,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         cumulative_s_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
         stream: cuda.CUstream,
+        learnable_sink: cute.Tensor | None = None,
+        mdSink: cute.Tensor | None = None,
     ):
         """Host function to launch CuTeDSL kernel."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
@@ -780,6 +787,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sdK_epi_layout,
             sdV_epi_layout,
             self.tile_sched_params,
+            learnable_sink,
+            mdSink,
         ).launch(
             grid=bwd_grid,
             block=[self.threads_per_cta, 1, 1],
@@ -837,6 +846,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        learnable_sink: cute.Tensor | None = None,
+        mdSink: cute.Tensor | None = None,
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1490,6 +1501,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             dV_tma,
                             sdK_epi_layout,
                             sdV_epi_layout,
+                            learnable_sink,
+                            mdSink,
                         )
                         cute.arch.barrier(
                             barrier_id=self.epilogue_sync_bar_id,
@@ -1690,6 +1703,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     dV_tma,
                     sdK_epi_layout,
                     sdV_epi_layout,
+                    learnable_sink,
+                    mdSink,
                 )
 
                 cute.arch.barrier(
@@ -1718,7 +1733,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         """Get Q tiles range."""
         Q_block_max = cute.ceil_div(seq_Q, self.tile_shape_Q)
         Q_block_min = cutlass.Int32(0)
-        if cutlass.const_expr(self.has_sliding_window):
+        if cutlass.const_expr(self.has_sliding_window and self.has_window_left):
             # For 2cta, use the last K block in the cluster so both CTAs get the same Q_block_max
             blk_coord_k_for_max = (blk_coord_k // 2) * 2 + 1
             Q_block_max_tmp = cute.ceil_div(
@@ -1729,7 +1744,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 self.tile_shape_Q,
             )
             Q_block_max = min(Q_block_max, Q_block_max_tmp)
-        if cutlass.const_expr(self.is_causal or self.has_sliding_window):
+        if cutlass.const_expr(
+            self.is_causal or (self.has_sliding_window and self.has_window_right)
+        ):
             # For 2cta, use the first K block in the cluster so both CTAs get the same Q_block_min.
             # This ensures both CTAs in a cluster run the same number of pipeline iterations,
             # avoiding hang from mismatched producer_commit / consumer_wait counts.
@@ -2500,6 +2517,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dV_tma: cute.Tensor,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
+        learnable_sink: cute.Tensor | None = None,
+        mdSink: cute.Tensor | None = None,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2545,6 +2564,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         is_residual_k = blk_coord_k * self.tile_shape_K + self.tile_shape_K > K
         last_iter = iter_end - 1
+
+        # Setup learnable_sink-related state (per-CTA, per-tile).
+        sink_log2_e = None
+        h_r_count = None
+        blk_coord_h_k_local = None
+        current_h_r = Int32(0)
+        dsink_acc_total = cutlass.Float32(0.0)
+        if cutlass.const_expr(learnable_sink is not None):
+            sink_log2_e = cutlass.Float32(math.log2(math.e))
+            h_r_count = problem_shape[3][0][0]
+            blk_coord_h_k_local = blk_coord[3][0][1]
 
         while iter_count > 0:
             s_handle = mma_compute_S_consumer.wait_and_advance()
@@ -2596,11 +2626,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         cute.get(c_transpose, mode=[0]) + blk_coord_k * self.tile_shape_K,
                     )
                     if cutlass.const_expr(self.has_sliding_window):
-                        if cutlass.const_expr(self.window_size_left < 0):
+                        if cutlass.const_expr(not self.has_window_left):
                             tTR_rST[i] = (
                                 -cutlass.Float32.inf
                                 if pos[1] > pos[0] + K - Q + self.window_size_right
                                 else tTR_rST[i]
+                            )
+                        elif cutlass.const_expr(not self.has_window_right):
+                            min_K_index = max(0, pos[0] + K - Q - self.window_size_left)
+                            tTR_rST[i] = (
+                                -cutlass.Float32.inf if pos[1] < min_K_index else tTR_rST[i]
                             )
                         else:
                             max_K_index = min(pos[0] + K - Q + self.window_size_right, K)
@@ -2657,6 +2692,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             p_handle.commit()
 
+            # For learnable_sink: precompute per-element exp2(sink - lse) factor
+            # before lse_handle is released (sLSE shared memory will be reused).
+            tTR_rFactor = None
+            if cutlass.const_expr(learnable_sink is not None):
+                q_head_idx = blk_coord_h_k_local * h_r_count + current_h_r
+                sink_log2 = cutlass.Float32(learnable_sink[q_head_idx]) * sink_log2_e
+                tTR_rFactor = cute.make_rmem_tensor(tTR_cdPT.shape, self.acc_dtype)
+                for i in cutlass.range(cute.size(tTR_rFactor), unroll_full=True):
+                    q_idx = cute.get(tTR_cdPT[i], mode=[1])
+                    tTR_rFactor[i] = cute.math.exp2(
+                        sink_log2 - sLSE[q_idx, lse_handle.index], fastmath=True
+                    )
+
             s_handle.release()
             lse_handle.release()
 
@@ -2666,6 +2714,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             # Compute dS = dsoftmax(P, dP, sum_OdO)
             cute.copy(tiled_t2r, tTR_tdPT, tTR_rdPT)
+
+            # Accumulate dsink contribution: sum_{k,q in tile} P[k,q] * dP_raw[k,q] * exp2(sink - lse[q])
+            if cutlass.const_expr(learnable_sink is not None):
+                for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
+                    dsink_acc_total = dsink_acc_total + (tTR_rST[i] * tTR_rdPT[i] * tTR_rFactor[i])
 
             for i in cutlass.range(0, cute.size(tTR_rdPT), 2, unroll_full=True):
                 dpsum_0 = -sSum_OdO[
@@ -2724,6 +2777,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             iter_count -= 1
             iter_index += 1
             if iter_index == iter_end:
+                # Flush dsink accumulator for the current q-head before moving to next h_r.
+                if cutlass.const_expr(learnable_sink is not None):
+                    q_head_idx_flush = blk_coord_h_k_local * h_r_count + current_h_r
+                    dsink_reduced = fa_utils.warp_reduce(dsink_acc_total, operator.add)
+                    if cute.arch.lane_idx() == 0 and dsink_reduced != cutlass.Float32(0.0):
+                        fa_utils.atomic_add_fp32(
+                            -dsink_reduced, fa_utils.elem_pointer(mdSink, (q_head_idx_flush,))
+                        )
+                    dsink_acc_total = cutlass.Float32(0.0)
+                    current_h_r = current_h_r + Int32(1)
                 iter_index = iter_start
 
         # Epilogue

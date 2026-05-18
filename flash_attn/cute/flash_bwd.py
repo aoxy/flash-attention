@@ -384,6 +384,8 @@ class FlashAttentionBackwardSm80:
         mSeqUsedK: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
+        mdSink: Optional[cute.Tensor] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
@@ -394,6 +396,9 @@ class FlashAttentionBackwardSm80:
     ):
         assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
             "determinism not supported yet for Sm80"
+        )
+        assert learnable_sink is None and mdSink is None, (
+            "FlashAttentionBackwardSm80 does not support learnable_sink yet"
         )
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
