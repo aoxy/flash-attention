@@ -704,7 +704,8 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<const at::Tensor> learnable_sink_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1089,6 +1090,18 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         params.kv_batch_idx = reinterpret_cast<int *>(kv_batch_idx.data_ptr());
     }
 
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.pack_gqa = false; // Disable pack_gqa if learnable sink is provided
+    } else {
+        params.learnable_sink_ptr = nullptr;
+    }
+
     at::Tensor out_accum, softmax_lse_accum;
     auto outaccum_type = at::ScalarType::Float;
     if (params.num_splits > 1) {
@@ -1286,7 +1299,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int64_t window_size_right,
     double softcap,
     bool deterministic,
-    int64_t sm_margin
+    int64_t sm_margin,
+    std::optional<const at::Tensor> learnable_sink_,
+    std::optional<at::Tensor> dsink_
 ) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
@@ -1473,7 +1488,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
 
     auto opts = q.options();
     // Need softmax_d to have total_q_padded_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
-    at::Tensor softmax_d, softmax_lse_log2;
+    at::Tensor softmax_d, dsink, softmax_lse_log2;
     if (!is_varlen) {
         // Need softmax_d to have seqlen_q_rounded since we want its address to be aligned by 16/8 bytes for TMA / LDG.64
         softmax_d = torch::empty({batch_size, num_heads, seqlen_q_rounded}, opts.dtype(at::kFloat));
@@ -1530,6 +1545,28 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     params.dv = head_size_v;
     params.dv_rounded = head_size_v_rounded;
 
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
+            dsink = dsink_.value();
+            CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
+        } else {
+            dsink = torch::empty_like(learnable_sink);
+        }
+        dsink.zero_();
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.dsink_ptr = dsink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+        params.dsink_ptr = nullptr;
+    }
+
     // auto tile_count_semaphore = (params.is_causal || params.is_local) ? torch::zeros({1}, opts.dtype(torch::kInt32)) : torch::empty({1}, opts.dtype(torch::kInt32));
     // params.tile_count_semaphore = tile_count_semaphore.data_ptr<int>();
     // Will be zero'ed out in the backward preprocess kernel
@@ -1562,6 +1599,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     } else if (total_q > 0 && num_heads_k > 0) {
         dq.zero_();
         softmax_d.zero_();
+    }
+
+    if (learnable_sink_.has_value()) {
+        if (dsink_.has_value() && dsink_.value().dtype() != torch::kFloat32) {
+            dsink = dsink.to(dsink_.value().dtype());
+            dsink_.value().copy_(dsink);
+        }
     }
 
     return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
