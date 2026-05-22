@@ -30,7 +30,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Has_sink_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool Has_sink_, bool Use_fa4_sink_=false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -53,6 +53,7 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Has_sink = Has_sink_;
+    static constexpr bool Use_fa4_sink = Use_fa4_sink_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
@@ -398,7 +399,6 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         float const* const ptr_Sink = nullptr;
-        bool const use_fa4_sink = false;
     };
 
     // Device side kernel params
@@ -457,7 +457,6 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
         float const* const ptr_Sink = nullptr;
-        bool const use_fa4_sink = false;
     };
 
     static Params
@@ -569,7 +568,7 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_Sink, args.use_fa4_sink};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary, args.ptr_Sink};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
