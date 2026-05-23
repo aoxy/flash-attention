@@ -213,13 +213,21 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
                     APPENDKV_SWITCH(params.knew_ptr, AppendKV, [&] {
                         SINK_SWITCH(params.learnable_sink_ptr != nullptr, Has_sink, [&] {
                             static constexpr bool PackGQA_Sink = PackGQA && !Has_sink;
-                            BOOL_SWITCH(Has_sink && params.use_fa4_sink, Use_fa4_sink, [&] {
-                            // Only use Cluster if number of tiles along seqlen_q is even and not varlen
-                            CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
-                                static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
-                                run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink, Use_fa4_sink>(params, stream);
-                            });
-                            });
+                            // Only instantiate Use_fa4_sink=true/false when Has_sink=true.
+                            // When Has_sink=false, Use_fa4_sink is always false (no extra kernel).
+                            if constexpr (Has_sink) {
+                                BOOL_SWITCH(params.use_fa4_sink, Use_fa4_sink, [&] {
+                                CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                                    static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink, Use_fa4_sink>(params, stream);
+                                });
+                                });
+                            } else {
+                                CLUSTER_SWITCH(cutlass::ceil_div(params.seqlen_q * (!PackGQA_Sink ? 1 : params.h / params.h_k), kBlockM) % 2 == 0, Use_cluster, [&] {
+                                    static constexpr int ClusterM = Enable_cluster && Use_cluster ? 2 : 1;
+                                    run_flash_fwd<Arch, kHeadDim, kHeadDimV, ClusterM, T, T_out, Is_causal, Is_local, Has_softcap, Varlen, PagedKVNonTMA, AppendKV && Varlen, HasQv, PackGQA_Sink, Split, V_colmajor, Has_sink, false>(params, stream);
+                                });
+                            }
                         });
                     });
                 });
