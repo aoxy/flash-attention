@@ -104,11 +104,14 @@ COMPILED_HDIMS = (
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
 @pytest.mark.parametrize("has_learnable_sink", [False] + ([True] if not DISABLE_SINK else []))
+@pytest.mark.parametrize("use_fa4_sink", [False] + ([True] if not DISABLE_SINK else []))
 def test_flash_attn_output(
-        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype, has_learnable_sink
+        seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype, has_learnable_sink, use_fa4_sink
 ):
     if V_colmajor and (seqlen_k % 16 != 0 or dtype != torch.float8_e4m3fn):
         pytest.skip("V_colmajor requires seqlen_k to be a multiple of 16 and dtype to be float8_e4m3fn")
+    if not has_learnable_sink and use_fa4_sink:
+        pytest.skip("use_fa4_sink requires has_learnable_sink to be True")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -216,7 +219,7 @@ def test_flash_attn_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 learnable_sink=learnable_sink,
-                use_fa4_sink=True,
+                use_fa4_sink=use_fa4_sink,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -356,9 +359,12 @@ def test_flash_attn_output(
     ],
 )
 @pytest.mark.parametrize("has_learnable_sink", [False] + ([True] if not DISABLE_SINK else []))
+@pytest.mark.parametrize("use_fa4_sink", [False] + ([True] if not DISABLE_SINK else []))
 def test_flash_attn_varlen_output(
-        seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype, has_learnable_sink
+        seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype, has_learnable_sink, use_fa4_sink
 ):
+    if not has_learnable_sink and use_fa4_sink:
+        pytest.skip("use_fa4_sink requires has_learnable_sink to be True")
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
@@ -513,7 +519,7 @@ def test_flash_attn_varlen_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 learnable_sink=learnable_sink,
-                use_fa4_sink=True,
+                use_fa4_sink=use_fa4_sink,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
