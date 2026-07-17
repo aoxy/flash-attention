@@ -1920,22 +1920,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     lse_handle = load_lse_consumer.wait_and_advance()
                     sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
+                    sink_factor = None
+                    dsink_acc = None
                     if cutlass.const_expr(learnable_sink is not None):
                         thread_idx = tidx % (self.threads_per_warp * len(self.compute_warp_ids))
                         head_idx = curr_block_coord[2][0]
                         sink_log2 = Float32(learnable_sink[head_idx]) * Float32(math.log2(math.e))
+                        # Each compute thread owns one local Q row across its TMEM fragment.
                         q_idx = curr_block_coord[0] * self.cta_tiler[0] + thread_idx
-                        dsink = Float32(0.0)
+                        sink_factor = Float32(0.0)
                         if cute.elem_less(q_idx, seqlen_q):
                             sink_factor = cute.math.exp2(
                                 sink_log2 - sLSE[thread_idx, lse_handle.index], fastmath=True
                             )
-                            dsink = -sink_factor * sSum_OdO[thread_idx, sum_odo_handle.index]
-                        dsink = fa_utils.warp_reduce(dsink, operator.add)
-                        if cute.arch.lane_idx() == 0 and dsink != Float32(0.0):
-                            fa_utils.atomic_add_fp32(
-                                dsink, fa_utils.elem_pointer(mdSink, (head_idx,))
-                            )
+                        dsink_acc = (Float32(0.0), Float32(0.0))
                     for step in cutlass.range(start_count, end_count, 1, unroll=1):
                         cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
@@ -1956,33 +1954,43 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             )
                         else:
                             need_apply_mask = step == end_count - 1
-                        mma_s_consumer, mma_dp_consumer, ds_mma_producer = self.compute_step(
-                            (need_apply_mask, window_size_left, window_size_right),
-                            (
-                                seqlen_q,
-                                seqlen_k,
-                                scale_softmax,
-                                batch_coord,
-                                curr_block_coord[0],
-                                varlen,
-                            ),
-                            (
-                                tStS,
-                                tScS_iter,
-                                tdPtdP,
-                                tdPcdP_iter,
-                                sLSE,
-                                sSum_OdO,
-                            ),
-                            (
-                                mma_s_consumer,
-                                mma_dp_consumer,
-                                ds_mma_producer,
-                                lse_handle,
-                                sum_odo_handle,
-                            ),
-                            step,
+                        mma_s_consumer, mma_dp_consumer, ds_mma_producer, dsink_acc = (
+                            self.compute_step(
+                                (need_apply_mask, window_size_left, window_size_right),
+                                (
+                                    seqlen_q,
+                                    seqlen_k,
+                                    scale_softmax,
+                                    batch_coord,
+                                    curr_block_coord[0],
+                                    varlen,
+                                ),
+                                (
+                                    tStS,
+                                    tScS_iter,
+                                    tdPtdP,
+                                    tdPcdP_iter,
+                                    sLSE,
+                                    sSum_OdO,
+                                    sink_factor,
+                                    dsink_acc,
+                                ),
+                                (
+                                    mma_s_consumer,
+                                    mma_dp_consumer,
+                                    ds_mma_producer,
+                                    lse_handle,
+                                    sum_odo_handle,
+                                ),
+                                step,
+                            )
                         )
+                    if cutlass.const_expr(learnable_sink is not None):
+                        dsink = fa_utils.warp_reduce(dsink_acc[0] + dsink_acc[1], operator.add)
+                        if cute.arch.lane_idx() == 0 and dsink != Float32(0.0):
+                            fa_utils.atomic_add_fp32(
+                                -dsink, fa_utils.elem_pointer(mdSink, (head_idx,))
+                            )
                     lse_handle.release()
                     sum_odo_handle.release()
 
@@ -2125,7 +2133,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         need_apply_mask, window_size_left, window_size_right = mask_args
         seqlen_q, seqlen_k, scale_softmax, batch_coord, block_m_idx, varlen = value_args
-        tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO = tensor_args
+        tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO, sink_factor, dsink_acc = tensor_args
         mma_s_consumer, mma_dp_consumer, ds_mma_producer, lse_handle, sum_odo_handle = pipeline_args
 
         bidx = block_m_idx
@@ -2193,6 +2201,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tTMEM_STORErdP = cute.make_rmem_tensor(tTMEM_LOADrdP.shape, self.q_dtype)
 
         for k in cutlass.range(0, cute.size(tTMEM_LOADrdP), 2, unroll_full=True):
+            pdp = None
+            if cutlass.const_expr(sink_factor is not None):
+                # Reuse P * dP for both dsink and dS = P * dP - P * dpsum.
+                pdp = cute.arch.mul_packed_f32x2(
+                    (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
+                    (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
+                )
+                dsink_acc = cute.arch.fma_packed_f32x2(pdp, (sink_factor, sink_factor), dsink_acc)
             dpsum_0 = -sSum_OdO[
                 cute.get(tTMEM_LOADcdP[k], mode=[0]) - bidx * self.cta_tiler[0],
                 sum_odo_handle.index,
@@ -2206,14 +2222,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     dpsum_0 = 0.0
                 if not cute.elem_less(cute.get(tTMEM_LOADcdP[k + 1], mode=[0]), seqlen_q):
                     dpsum_1 = 0.0
-            tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.add_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
-                (dpsum_0, dpsum_1),
-            )
-            tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
-                (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
-            )
+            if cutlass.const_expr(sink_factor is not None):
+                tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.fma_packed_f32x2(
+                    (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
+                    (dpsum_0, dpsum_1),
+                    pdp,
+                )
+            else:
+                tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.add_packed_f32x2(
+                    (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
+                    (dpsum_0, dpsum_1),
+                )
+                tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
+                    (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
+                    (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
+                )
             tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
                 (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]), (scale_softmax, scale_softmax)
             )
@@ -2245,7 +2268,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cute.copy(tmem_tiled_store, tTMEM_STORErdS_, tTMEM_STOREtdS)
         cute.arch.fence_view_async_tmem_store()
         ds_handle.commit()
-        return mma_s_consumer, mma_dp_consumer, ds_mma_producer
+        return mma_s_consumer, mma_dp_consumer, ds_mma_producer, dsink_acc
 
     @cute.jit
     def dQ_epilogue(
