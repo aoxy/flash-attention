@@ -61,6 +61,7 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
 VERBOSE = True
+LEARNABLE_SINK_DTYPES = (torch.bfloat16, torch.float32, torch.float16)
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -222,7 +223,8 @@ def test_flash_attn_output(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device).requires_grad_()
+            sink_dtype = LEARNABLE_SINK_DTYPES[(seqlen_q + seqlen_k + d + int(causal) + int(local_enum)) % len(LEARNABLE_SINK_DTYPES)]
+            learnable_sink = torch.randn(nheads, dtype=sink_dtype, device=device).requires_grad_()
         else:
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -435,6 +437,8 @@ def test_flash_attn_output(
                 (dsink,) = torch.autograd.grad(out, learnable_sink, g)
                 (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
                 (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+                assert dsink.dtype == learnable_sink.dtype
+                assert dsink_ref.dtype == learnable_sink.dtype
                 print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
                 print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
                 print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")
@@ -626,7 +630,8 @@ def test_flash_attn_varlen_output(
         if local:
             print("window size = ", window_size)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device).requires_grad_()
+            sink_dtype = LEARNABLE_SINK_DTYPES[(seqlen_q + seqlen_k + d + int(causal) + int(local_enum)) % len(LEARNABLE_SINK_DTYPES)]
+            learnable_sink = torch.randn(nheads, dtype=sink_dtype, device=device).requires_grad_()
         else:
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
@@ -975,6 +980,8 @@ def test_flash_attn_varlen_output(
                 (dsink,) = torch.autograd.grad(out_unpad, learnable_sink, g_unpad)
                 (dsink_ref,) = torch.autograd.grad(out_ref, learnable_sink, g)
                 (dsink_pt,) = torch.autograd.grad(out_pt, learnable_sink, g)
+                assert dsink.dtype == learnable_sink.dtype
+                assert dsink_ref.dtype == learnable_sink.dtype
                 print(f"dSink max diff: {(dsink - dsink_ref).abs().max().item()}")
                 print(f"dSink mean diff: {(dsink - dsink_ref).abs().mean().item()}")
                 print(f"dSink Pytorch max diff: {(dsink_pt - dsink_ref).abs().max().item()}")

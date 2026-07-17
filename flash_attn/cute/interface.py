@@ -401,7 +401,7 @@ def _flash_attn_fwd(
             )
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+    learnable_sink_dtype = learnable_sink.dtype if learnable_sink is not None else None
 
     if not is_fake_mode():
         assert all(
@@ -698,7 +698,7 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
-        learnable_sink is not None,
+        learnable_sink_dtype,
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
@@ -1488,7 +1488,7 @@ def _flash_attn_bwd(
 
     # Allocate dsink gradient if learnable_sink is used.
     # The backward kernels atomic_add into a zero-initialized fp32 scratch
-    # (`dsink_accum`); `learnable_sink` is bf16 (asserted in _flash_attn_fwd).
+    # (`dsink_accum`) for numerical stability across sink input dtypes.
     # When `dsink` is None we return a fresh tensor with `learnable_sink.dtype`.
     # When `dsink` is supplied it must be either fp32 (used directly as the
     # accumulator, opting into higher precision) or `learnable_sink.dtype`
@@ -1637,7 +1637,7 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
-            learnable_sink is not None,
+            learnable_sink.dtype if learnable_sink is not None else None,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1683,7 +1683,7 @@ def _flash_attn_bwd(
             window_size_right is not None,
             window_size_left if use_dedicated_hd256_kernel else None,
             window_size_right if use_dedicated_hd256_kernel else None,
-            learnable_sink is not None,
+            learnable_sink.dtype if learnable_sink is not None else None,
             m_block_size,
             n_block_size,
             num_threads,
