@@ -49,13 +49,22 @@ def _make_bwd_fn(fwd_fn, g, inputs):
 
     Args:
         fwd_fn: zero-arg callable that runs the forward pass (with autograd).
-        g: gradient tensor (b, seqlen, nheads, headdim_v).
+        g: gradient tensor matching the forward output. Varlen callers may pass
+            either an already-unpadded tensor or a dense tensor that can be
+            flattened to the output shape.
         inputs: list of input tensors whose .grad should be cleared each iteration.
     """
     out = fwd_fn()
     if isinstance(out, tuple):
         out = out[0]
-    g_match = g[:out.shape[0]] if g.shape[0] != out.shape[0] else g  # handle varlen
+    if g.shape == out.shape:
+        g_match = g
+    elif g.numel() == out.numel():
+        g_match = g.reshape(out.shape)
+    elif g.ndim == out.ndim and g.shape[0] >= out.shape[0] and g.shape[1:] == out.shape[1:]:
+        g_match = g[:out.shape[0]]
+    else:
+        raise ValueError(f"grad shape {tuple(g.shape)} does not match output shape {tuple(out.shape)}")
     def bwd_fn():
         for x in inputs:
             if x is not None:
@@ -93,10 +102,10 @@ def setup_fa2(ctx):
     dropout_p, window_size_fa, softcap = ctx["dropout_p"], ctx["window_size_fa"], ctx["softcap"]
     deterministic = ctx["deterministic"]
     if ctx["varlen"]:
-        qu, ku, vu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"]
+        qu, ku, vu, gu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"], ctx["g_unpad"]
         csq, csk, sq, sk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"], ctx["seqlen_q"], ctx["seqlen"]
         fwd_fn = lambda: flash_attn_varlen_func(qu, ku, vu, csq, csk, sq, sk, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap)
-        bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func(qu, ku, vu, csq, csk, sq, sk, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic), g, [qu, ku, vu]) if ctx["has_backward"] else None
+        bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func(qu, ku, vu, csq, csk, sq, sk, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic), gu, [qu, ku, vu]) if ctx["has_backward"] else None
     else:
         fwd_fn = lambda: flash_attn_func(q, k, v, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap)
         bwd_fn = _make_bwd_fn(lambda: flash_attn_func(q, k, v, dropout_p, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic), g, [q, k, v]) if ctx["has_backward"] else None
@@ -146,7 +155,8 @@ def setup_fa3(ctx):
     bwd_fn = None
     if ctx["has_backward"] and ctx["dtype"] != torch.float8_e4m3fn and ctx["headdim"] == ctx["headdim_v"]:
         if ctx["varlen"]:
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=ctx["window_size"], softcap=softcap, deterministic=deterministic, **sink_kwargs_varlen), g, [qu, ku, vu])
+            gu = ctx["g_unpad"]
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_v3(qu, ku, vu, csq, csk, sq, sk, causal=causal, window_size=ctx["window_size"], softcap=softcap, deterministic=deterministic, **sink_kwargs_varlen), gu, [qu, ku, vu])
         else:
             bwd_fn = _make_bwd_fn(lambda: flash_attn_func_v3(q, k, v, causal=causal, window_size=window_size_fa, softcap=softcap, deterministic=deterministic, **sink_kwargs), g, [q, k, v])
     return fwd_fn, bwd_fn
@@ -189,7 +199,7 @@ def setup_fa4(ctx):
 # Ordered list of (display_name, cli_name, setup_fn)
 BACKENDS = [
     ("FA4",      "fa4",      setup_fa4),
-    ("Standard", "standard", setup_standard),
+    # ("Standard", "standard", setup_standard),
     ("FA2",      "fa2",      setup_fa2),
     # ("cuDNN",    "cudnn",    setup_cudnn),
     ("FA3",      "fa3",      setup_fa3),
@@ -350,7 +360,8 @@ def parse_args():
                         help='Warmup iterations (default: 5)')
     parser.add_argument('--rep', type=int, default=10,
                         help='Repetitions per benchmark (default: 10)')
-    parser.add_argument('--sink', action='store_true', help='Run forward only')
+    parser.add_argument('--sink', type=str.lower, choices=['true', 'false', 'both'], default='both',
+                        help='Causal mode (default: both)')
     return parser.parse_args()
 
 
@@ -383,7 +394,6 @@ def main():
     # Parse fwd/bwd: if neither specified, do fwd only
     has_forward = args.fwd or not args.bwd
     has_backward = args.bwd
-    has_sink = args.sink
 
     # Parse causal
     if args.causal == 'true':
@@ -392,6 +402,13 @@ def main():
         causal_vals = [False]
     else:
         causal_vals = [False, True]
+
+    if args.sink == 'true':
+        sink_vals = [True]
+    elif args.sink == 'false':
+        sink_vals = [False]
+    else:
+        sink_vals = [False, True]
 
     seqlen_list = args.seqlen
     seqlen_q_list = resolve_seqlen_q_list(seqlen_list, args.seqlen_q)
@@ -429,9 +446,7 @@ def main():
         else:
             nheads_kv = nheads
         has_qv = headdim == 64 and headdim_v == 512
-        sinks = None
-        if has_sink:
-            sinks = torch.randn(nheads, device=device, dtype=dtype_gen)
+        sinks = torch.randn(nheads, device=device, dtype=dtype_gen)
 
         num_splits = args.num_splits
         window_size = (None, None)
@@ -478,8 +493,11 @@ def main():
                     gather_kv_indices_unpad = rearrange(gather_kv_indices, "b s t -> (b s) t")
                 gather_kv_eff = gather_kv_length
 
-            for causal in causal_vals:
-                cfg = (headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff)
+            # for causal in causal_vals:
+            #     cfg = (headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff)
+            for has_sink in sink_vals:
+                causal = True
+                cfg = (headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff, has_sink)
 
                 # Build context dict shared by all backends
                 ctx = dict(
@@ -492,7 +510,7 @@ def main():
                     page_size=page_size, k_paged=k_paged, v_paged=v_paged, page_table=page_table,
                     dropout_p=dropout_p, window_size=window_size, window_size_fa=window_size_fa,
                     softcap=softcap, deterministic=deterministic,
-                    num_splits=num_splits, pack_gqa=pack_gqa, sinks=sinks,
+                    num_splits=num_splits, pack_gqa=pack_gqa, sinks=sinks if has_sink else None,
                     gather_kv_indices=gather_kv_indices, gather_kv_indices_unpad=gather_kv_indices_unpad,
                 )
 
@@ -539,6 +557,7 @@ def main():
             header += f" {'seqlen_q':>8} {'seqlen_kv':>9}"
         else:
             header += f" {'seqlen':>6}"
+        header += f" {'has_sink':>6}"
         if show_gather_kv_col:
             header += f" {'gather_kv':>6}"
         for b in shown_backends:
@@ -550,7 +569,7 @@ def main():
         print("-" * len(header))
 
         for cfg in configs:
-            headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff = cfg
+            headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff, has_sink = cfg
             has_qv = (headdim == 64 and headdim_v == 512)
             seqlen_k_eff = gather_kv_eff if gather_kv_eff is not None else seqlen
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen_k_eff, headdim, headdim_v, causal=causal, has_qv=has_qv)
@@ -567,6 +586,7 @@ def main():
                 row += f" {seqlen_q:>8} {seqlen:>9}"
             else:
                 row += f" {seqlen:>6}"
+            row += f" {str(has_sink):>6}"
             if show_gather_kv_col:
                 row += f" {str(gather_kv_eff) if gather_kv_eff is not None else '—':>6}"
             for b in shown_backends:
