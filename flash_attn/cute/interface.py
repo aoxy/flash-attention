@@ -529,9 +529,44 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
+    # Short ragged GQA lacks enough work to amortize the dedicated 2CTA kernel.
+    is_short_ragged_hd256_pack_gqa = (
+        arch // 10 == 10
+        and q.dtype == torch.bfloat16
+        and head_dim == 256
+        and head_dim_v == 256
+        and qhead_per_kvhead > 1
+        and pack_gqa
+        and qv is None
+        and learnable_sink is not None
+        and softcap is None
+        and score_mod is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and aux_tensors is None
+        and num_splits == 1
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and seqused_q is None
+        and seqused_k is None
+        and max_seqlen_q == max_seqlen_k
+        and max_seqlen_q <= 8192
+        and total_q < batch_size * max_seqlen_q
+        and seqlen_k < batch_size * max_seqlen_k
+    )
+    use_generic_hd256_pack_gqa = is_short_ragged_hd256_pack_gqa and (
+        (causal and not local and qhead_per_kvhead == 12)
+        or (
+            local
+            and window_size_left is not None
+            and window_size_right == 0
+        )
+    )
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        q_stage = 1 if use_generic_hd256_pack_gqa else (
+            2 if seqlen_q_packgqa > tile_m else 1
+        )
     else:
         q_stage = 1
 
@@ -576,8 +611,25 @@ def _flash_attn_fwd(
     )
 
     # hd=256 2CTA forward uses dedicated kernel (SM100 only)
-    use_dedicated_hd256_kernel = arch // 10 == 10 and head_dim == 256 and head_dim_v == 256
+    use_dedicated_hd256_kernel = (
+        arch // 10 == 10
+        and head_dim == 256
+        and head_dim_v == 256
+        and not use_generic_hd256_pack_gqa
+    )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    uniform_varlen_batch_size = None
+    if (
+        use_dedicated_hd256_kernel
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and q.ndim == 3
+        and k.ndim == 3
+        and not is_split_kv
+        and q.shape[0] == batch_size * max_seqlen_q
+        and k.shape[0] == batch_size * max_seqlen_k
+    ):
+        uniform_varlen_batch_size = batch_size
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -713,6 +765,9 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
+        uniform_varlen_batch_size,
+        max_seqlen_q if use_dedicated_hd256_kernel and cu_seqlens_q is not None else None,
+        max_seqlen_k if use_dedicated_hd256_kernel and cu_seqlens_k is not None else None,
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
@@ -737,13 +792,24 @@ def _flash_attn_fwd(
             else None
             for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
         ]
+        if uniform_varlen_batch_size is not None:
+            cu_seqlens_q_tensor = None
+            cu_seqlens_k_tensor = None
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
             if page_table is not None
             else None
         )
+        q_for_kernel, k_for_kernel, v_for_kernel = q, k, v
+        out_for_kernel = out if not is_split_kv else out_partial
+        if uniform_varlen_batch_size is not None:
+            q_for_kernel = q.view(batch_size, max_seqlen_q, num_head, head_dim)
+            k_for_kernel = k.view(batch_size, max_seqlen_k, num_head_kv, head_dim)
+            v_for_kernel = v.view(batch_size, max_seqlen_k, num_head_kv, head_dim_v)
+            out_for_kernel = out.view(batch_size, max_seqlen_q, num_head, head_dim_v)
         q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            to_cute_tensor(t)
+            for t in (q_for_kernel, k_for_kernel, v_for_kernel, out_for_kernel)
         ]
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
@@ -902,10 +968,19 @@ def _flash_attn_fwd(
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
                     paged_kv_non_tma=page_size not in [None, tile_n],
-                    is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                    is_varlen_q=(cu_seqlens_q is not None or seqused_q is not None)
+                    and uniform_varlen_batch_size is None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    **(
+                        {
+                            "max_seqlen_q": max_seqlen_q,
+                            "uniform_varlen": uniform_varlen_batch_size is not None,
+                        }
+                        if use_dedicated_hd256_kernel
+                        else {}
+                    ),
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -986,6 +1061,12 @@ def _flash_attn_fwd(
 
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
+        out_call = out.detach() if not is_split_kv else out_partial
+        if uniform_varlen_batch_size is not None:
+            q_call = q_call.view(batch_size, max_seqlen_q, num_head, head_dim)
+            k_call = k_call.view(batch_size, max_seqlen_k, num_head_kv, head_dim)
+            v_call = v_call.view(batch_size, max_seqlen_k, num_head_kv, head_dim_v)
+            out_call = out_call.view(batch_size, max_seqlen_q, num_head, head_dim_v)
         qv_call = qv.detach() if qv is not None else None
         if is_fp8:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
@@ -1018,15 +1099,21 @@ def _flash_attn_fwd(
                 window_size_right,
             )
         else:
+            cu_seqlens_q_call = (
+                None if uniform_varlen_batch_size is not None else cu_seqlens_q
+            )
+            cu_seqlens_k_call = (
+                None if uniform_varlen_batch_size is not None else cu_seqlens_k
+            )
             call_args = [
                 q_call,
                 k_call,
                 v_call,
-                out.detach() if not is_split_kv else out_partial,
+                out_call,
                 lse_partial if is_split_kv else lse,
                 softmax_scale,
-                cu_seqlens_q,
-                cu_seqlens_k,
+                cu_seqlens_q_call,
+                cu_seqlens_k_call,
                 seqused_q,
                 seqused_k,
                 page_table,
@@ -1360,6 +1447,15 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
+    uniform_varlen = (
+        use_dedicated_hd256_kernel
+        and cu_seqlens_q is not None
+        and cu_seqlens_k is not None
+        and seqused_q is None
+        and seqused_k is None
+        and total_q == batch_size * seqlen_q
+        and total_k == batch_size * seqlen_k
+    )
 
     use_block_sparsity = block_sparse_tensors is not None
     subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
@@ -1451,6 +1547,20 @@ def _flash_attn_bwd(
         dv = torch.empty_like(v)
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
+
+    dq_result, dk_result, dv_result = dq, dk, dv
+    if uniform_varlen:
+        q = q.view(batch_size, seqlen_q, num_head, head_dim)
+        k = k.view(batch_size, seqlen_k, num_head_kv, head_dim)
+        v = v.view(batch_size, seqlen_k, num_head_kv, head_dim_v)
+        out = out.view(batch_size, seqlen_q, num_head, head_dim_v)
+        dout = dout.view(batch_size, seqlen_q, num_head, head_dim_v)
+        dq = dq.view(batch_size, seqlen_q, num_head, head_dim)
+        dk = dk.view(batch_size, seqlen_k, num_head_kv, head_dim)
+        dv = dv.view(batch_size, seqlen_k, num_head_kv, head_dim_v)
+        lse = lse.view(num_head, batch_size, seqlen_q).permute(1, 0, 2)
+        cu_seqlens_q = None
+        cu_seqlens_k = None
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
@@ -1690,6 +1800,8 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             use_2cta_instrs,
+            max_seqlen_q if use_dedicated_hd256_kernel and cu_seqlens_q is not None else None,
+            max_seqlen_k if use_dedicated_hd256_kernel and cu_seqlens_k is not None else None,
             deterministic,
             spt,
             score_mod_hash,
@@ -1824,6 +1936,8 @@ def _flash_attn_bwd(
                     tile_n_dkdv=dkdv_tile_mn[1],
                     window_size_left=window_size_left,
                     window_size_right=window_size_right,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -1965,7 +2079,7 @@ def _flash_attn_bwd(
         elif dsink is not dsink_accum:
             dsink.copy_(dsink_accum)
 
-    return dq, dk, dv, dsink
+    return dq_result, dk_result, dv_result, dsink
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")

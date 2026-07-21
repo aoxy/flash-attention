@@ -1108,6 +1108,36 @@ class SingleTileVarlenScheduler:
 # -----------------------------------------------------------------------------
 
 
+class Sm100FmhaVarlenTileScheduler(SingleTileVarlenScheduler):
+    """Compact varlen scheduler with the coordinate layout used by SM100 FMHA."""
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: SingleTileVarlenScheduler.Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "Sm100FmhaVarlenTileScheduler":
+        tile_idx, split_idx, _ = cute.arch.block_idx()
+        return Sm100FmhaVarlenTileScheduler(
+            params,
+            tile_idx,
+            split_idx,
+            loc=loc,
+            ip=ip,
+        )
+
+    @cute.jit
+    def _varlen_coord_map(self) -> WorkTileInfo:
+        work_tile = SingleTileVarlenScheduler._varlen_coord_map(self)
+        block, head, batch, _ = work_tile.tile_idx
+        return WorkTileInfo(
+            (block, Int32(0), (head, batch)),
+            work_tile.is_valid_tile,
+        )
+
+
 class Sm100FmhaStaticTileSchedulerParams:
     """A class to represent parameters for the FMHA (Fused Multi-Head Attention) static tile scheduler.
 

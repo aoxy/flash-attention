@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
+import operator
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -17,9 +18,11 @@ from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     ClcState,
+    TileSchedulerArguments,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
+    Sm100FmhaVarlenTileScheduler as FmhaVarlenTileScheduler,
     Sm100FmhaStaticTileScheduler as FmhaStaticTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
@@ -30,6 +33,7 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 import flash_attn.cute.copy_utils as fa_copy_utils
+import flash_attn.cute.utils as fa_utils
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
@@ -43,6 +47,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         is_persistent: bool,
         split_head: bool,
         use_clc_scheduler: bool = False,
+        max_seqlen_q: int | None = None,
     ):
         self.acc_dtype = acc_dtype
         self.mma_tiler = mma_tiler
@@ -88,6 +93,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.is_persistent = is_persistent
         self.use_clc_scheduler = use_clc_scheduler
         self.use_semantic_trip_range = self.is_causal or self.is_local
+        self.max_seqlen_q = max_seqlen_q
 
         self.compute_warp_ids = (0, 1, 2, 3)
         self.epilogue_warp_ids = (4, 5, 6, 7)
@@ -157,6 +163,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax: cutlass.Float32,
+        learnable_sink: Optional[cute.Tensor],
+        mdSink: Optional[cute.Tensor],
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
@@ -286,15 +294,34 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.dq_dtype = dq.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            assert not self.use_clc_scheduler, "Compact varlen scheduling does not use CLC"
+            tile_sched_args = TileSchedulerArguments(
+                num_block=cute.ceil_div(cute.size(dq.shape[0]), self.cta_tiler[0]),
+                num_head=cute.size(dq.shape[2][0]),
+                num_batch=b,
+                num_splits=1,
+                seqlen_k=cute.size(k.shape[0]),
+                headdim=d,
+                headdim_v=d,
+                total_q=cute.size(dq.shape[0]),
+                tile_shape_mn=self.cta_tiler[:2],
+                cluster_shape_mn=self.cluster_shape_mn,
+                mCuSeqlensQ=cum_seqlen_q,
+            )
+            self.tile_sched_params = FmhaVarlenTileScheduler.to_underlying_arguments(
+                tile_sched_args
+            )
+            grid = FmhaVarlenTileScheduler.get_grid_shape(self.tile_sched_params)
+        elif cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (s_q, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (s_q, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -545,6 +572,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cum_seqlen_q,
             cum_seqlen_k,
             scale_softmax,
+            learnable_sink,
+            mdSink,
             self.window_size_left,
             self.window_size_right,
             self.cluster_layout_vmnk,
@@ -591,6 +620,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax: Float32,
+        learnable_sink: Optional[cute.Tensor],
+        mdSink: Optional[cute.Tensor],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         cluster_layout_vmnk: cute.Layout,
@@ -603,7 +634,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         sdQ_epi_layout: cute.ComposedLayout,
         lse_smem_layout: cute.Layout,
         sum_odo_smem_layout: cute.Layout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: FmhaStaticTileSchedulerParams
+        | FmhaClcDynamicTileSchedulerParams
+        | FmhaVarlenTileScheduler.Params,
     ):
         # llvm.inline_asm(
         #     None,
@@ -886,7 +919,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             if warp_idx == self.empty_warp_id[_i]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            tile_sched = FmhaVarlenTileScheduler.create(tile_sched_params)
+        elif cutlass.const_expr(self.use_clc_scheduler):
             tile_sched = FmhaClcDynamicTileScheduler.create(
                 tile_sched_params,
                 cute.arch.block_idx(),
@@ -1885,6 +1920,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     lse_handle = load_lse_consumer.wait_and_advance()
                     sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
+                    if cutlass.const_expr(learnable_sink is not None):
+                        thread_idx = tidx % (self.threads_per_warp * len(self.compute_warp_ids))
+                        head_idx = curr_block_coord[2][0]
+                        sink_log2 = Float32(learnable_sink[head_idx]) * Float32(math.log2(math.e))
+                        q_idx = curr_block_coord[0] * self.cta_tiler[0] + thread_idx
+                        dsink = Float32(0.0)
+                        if cute.elem_less(q_idx, seqlen_q):
+                            sink_factor = cute.math.exp2(
+                                sink_log2 - sLSE[thread_idx, lse_handle.index], fastmath=True
+                            )
+                            dsink = -sink_factor * sSum_OdO[thread_idx, sum_odo_handle.index]
+                        dsink = fa_utils.warp_reduce(dsink, operator.add)
+                        if cute.arch.lane_idx() == 0 and dsink != Float32(0.0):
+                            fa_utils.atomic_add_fp32(
+                                dsink, fa_utils.elem_pointer(mdSink, (head_idx,))
+                            )
                     for step in cutlass.range(start_count, end_count, 1, unroll=1):
                         cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
@@ -1915,7 +1966,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 curr_block_coord[0],
                                 varlen,
                             ),
-                            (tStS, tScS_iter, tdPtdP, tdPcdP_iter, sLSE, sSum_OdO),
+                            (
+                                tStS,
+                                tScS_iter,
+                                tdPtdP,
+                                tdPcdP_iter,
+                                sLSE,
+                                sSum_OdO,
+                            ),
                             (
                                 mma_s_consumer,
                                 mma_dp_consumer,
@@ -2153,7 +2211,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 (dpsum_0, dpsum_1),
             )
             tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]), (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1])
+                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
+                (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
             )
             tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
                 (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]), (scale_softmax, scale_softmax)

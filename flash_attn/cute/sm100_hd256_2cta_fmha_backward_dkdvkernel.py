@@ -28,7 +28,9 @@ from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.tile_scheduler import (
     ClcState,
     SM100_TMEM_CAPACITY_COLUMNS,
+    TileSchedulerArguments,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
+    Sm100FmhaVarlenTileScheduler as FmhaVarlenTileScheduler,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
@@ -103,11 +105,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_left: int | None,
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
+        max_seqlen_k: int | None = None,
     ):
         """Initialization."""
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
+        self.max_seqlen_k = max_seqlen_k
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
@@ -202,6 +206,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.compute_mma_P_stage = 1
         self.compute_mma_dS_stage = 1
         self.mma_compute_dKdV_stage = 2
+        self.ex2_emu_freq = 14
+        self.ex2_emu_res_varlen = 6
 
         if cutlass.const_expr(self.use_clc_scheduler):
             self.num_clc_stage = 1
@@ -719,27 +725,51 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.shared_storage = SharedStorage
 
         # =============================== bwd ===============================
-        K_val = problem_shape[1]
         _, H_K = problem_shape[3][0]
         B = problem_shape[3][1]
-        problem_shape_mbh = (
-            cute.ceil_div(K_val, self.cta_tiler[1]),
-            cute.size(B),
-            cute.size(H_K),
-        )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self.tile_sched_params = FmhaClcDynamicTileSchedulerParams(
-                problem_shape_mbh,
-                (*self.cluster_shape_mn, 1),
+        if cutlass.const_expr(cumulative_s_k is not None):
+            assert not self.use_clc_scheduler, "Compact varlen scheduling does not use CLC"
+            tile_sched_args = TileSchedulerArguments(
+                num_block=cute.ceil_div(problem_shape[1], self.cta_tiler[1]),
+                num_head=cute.size(H_K),
+                num_batch=cute.size(B),
+                num_splits=1,
+                seqlen_k=problem_shape[0],
+                headdim=problem_shape[2],
+                headdim_v=problem_shape[2],
+                total_q=problem_shape[1],
+                tile_shape_mn=(self.cta_tiler[1], self.cta_tiler[0]),
+                cluster_shape_mn=self.cluster_shape_mn,
+                mCuSeqlensQ=cumulative_s_k,
+                element_size=K.element_type.width // 8,
             )
-            bwd_grid = FmhaClcDynamicTileScheduler.get_grid_shape(self.tile_sched_params)
+            self.tile_sched_params = FmhaVarlenTileScheduler.to_underlying_arguments(
+                tile_sched_args
+            )
+            bwd_grid = FmhaVarlenTileScheduler.get_grid_shape(self.tile_sched_params)
         else:
-            self.tile_sched_params = FmhaStaticTileSchedulerParams(
-                is_persistent=False,
-                problem_shape_mbh=problem_shape_mbh,
+            problem_shape_mbh = (
+                cute.ceil_div(problem_shape[1], self.cta_tiler[1]),
+                cute.size(B),
+                cute.size(H_K),
             )
-            bwd_grid = self._compute_bwd_grid(problem_shape, self.cta_tiler[1])
-            bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
+            if cutlass.const_expr(self.use_clc_scheduler):
+                self.tile_sched_params = FmhaClcDynamicTileSchedulerParams(
+                    problem_shape_mbh,
+                    (*self.cluster_shape_mn, 1),
+                )
+                bwd_grid = FmhaClcDynamicTileScheduler.get_grid_shape(self.tile_sched_params)
+            else:
+                self.tile_sched_params = FmhaStaticTileSchedulerParams(
+                    is_persistent=False,
+                    problem_shape_mbh=problem_shape_mbh,
+                )
+                bwd_grid = (
+                    cute.ceil_div(problem_shape[1], self.cta_tiler[1]),
+                    cute.size(H_K),
+                    cute.size(B),
+                )
+                bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
             KQ_tiled_mma,
@@ -845,7 +875,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sum_OdO_smem_layout: cute.Layout,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: FmhaStaticTileSchedulerParams
+        | FmhaClcDynamicTileSchedulerParams
+        | FmhaVarlenTileScheduler.Params,
         learnable_sink: cute.Tensor | None = None,
         mdSink: cute.Tensor | None = None,
     ):
@@ -1107,6 +1139,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         else:
             clc = None
             clc_response_ptr = None
+            if cutlass.const_expr(varlen):
+                tile_sched = FmhaVarlenTileScheduler.create(tile_sched_params)
+                work_tile = tile_sched.initial_work_tile_info()
 
         tSTtST_shape = KQ_tiled_mma.partition_shape_C(cute.select(self.KQ_mma_tiler, mode=[0, 1]))
         tSTtST = KQ_tiled_mma.make_fragment_C(tSTtST_shape)
@@ -1516,21 +1551,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         else:
             # ===== STATIC PATH: original non-persistent code =====
-            blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
+            blk_coord_k = bidx
+            blk_coord_h_k = bidy
+            blk_coord_b = bidz
+            is_valid_tile = True
+            if cutlass.const_expr(varlen):
+                is_valid_tile = work_tile.is_valid_tile
+                if is_valid_tile:
+                    blk_coord_k = work_tile.tile_idx[0]
+                    blk_coord_h_k = work_tile.tile_idx[2][0]
+                    blk_coord_b = work_tile.tile_idx[2][1]
+            blk_coord = (
+                Int32(0),
+                blk_coord_k,
+                Int32(0),
+                ((Int32(0), blk_coord_h_k), blk_coord_b),
+            )
             seqlen_q_cur_batch = Q_ref.shape[0]
             seqlen_k_cur_batch = K_ref.shape[0]
             blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
             if cutlass.const_expr(varlen):
                 assert isinstance(cumulative_s_q, cute.Tensor)
                 assert isinstance(cumulative_s_k, cute.Tensor)
-                seqlen_q_cur_batch = cumulative_s_q[bidz + 1] - cumulative_s_q[bidz]
-                seqlen_k_cur_batch = cumulative_s_k[bidz + 1] - cumulative_s_k[bidz]
-                blk_offset = (
-                    cumulative_s_q[bidz],
-                    cumulative_s_k[bidz],
-                    Int32(0),
-                    ((Int32(0), Int32(0)), Int32(0)),
-                )
+                if is_valid_tile:
+                    seqlen_q_cur_batch = (
+                        cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
+                    )
+                    seqlen_k_cur_batch = (
+                        cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
+                    )
+                    blk_offset = (
+                        cumulative_s_q[blk_coord_b],
+                        cumulative_s_k[blk_coord_b],
+                        Int32(0),
+                        ((Int32(0), Int32(0)), Int32(0)),
+                    )
 
             iter_start, iter_end = self.get_Q_block_min_max(
                 seqlen_q_cur_batch,
@@ -1549,8 +1604,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 problem_shape[2],
                 problem_shape[3],
             )
-            if iter_count <= 0:
-                if bidx * self.tile_shape_K < seqlen_k_cur_batch:
+            if not is_valid_tile:
+                pass
+            elif iter_count <= 0:
+                if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                     self.epilogue_clear(
                         blk_coord,
                         blk_offset,
@@ -1613,6 +1670,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     load_compute_sum_OdO_consumer,
                     load_mma_QT_producer,
                     load_mma_QT_consumer,
+                    blk_coord_k,
+                    blk_coord_h_k,
+                    blk_coord_b,
                 )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1754,8 +1814,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             Q_block_min_tmp = (
                 blk_coord_k_for_min * self.tile_shape_K + seq_Q - seq_K - self.window_size_right
             ) // self.tile_shape_Q
-            # Consider the case of 2cta, we need to ensure the K block is aligned to 2
-            Q_block_min_tmp = Q_block_min_tmp - Q_block_min_tmp % 2
             Q_block_min = max(Q_block_min_tmp, Q_block_min)
         return Q_block_min, Q_block_max
 
@@ -1816,7 +1874,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
     ):
         """TMA load."""
         tidx, _, _ = cute.arch.thread_idx()
-        if cutlass.const_expr(self.use_clc_scheduler):
+        if cutlass.const_expr(self.use_clc_scheduler or varlen):
             blk_coord_k = blk_coord_k_override
             blk_coord_h_k = blk_coord_h_k_override
             blk_coord_b = blk_coord_b_override
@@ -2563,6 +2621,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         tdVcST = PdO_tiled_mma.get_slice(0).partition_A(cST)
 
         is_residual_k = blk_coord_k * self.tile_shape_K + self.tile_shape_K > K
+        is_residual_q = Q % self.tile_shape_Q != 0
         last_iter = iter_end - 1
 
         # Setup learnable_sink-related state (per-CTA, per-tile).
@@ -2604,15 +2663,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 leading_causal_masking = cute.arch.shuffle_sync(leading_causal_masking, 0)
 
             trailing_residual_masking = cutlass.Boolean(False)
-            trailing_residual_masking = iter_index == last_iter or is_residual_k
+            trailing_residual_masking = (is_residual_q and iter_index == last_iter) or is_residual_k
             trailing_residual_masking = cute.arch.shuffle_sync(trailing_residual_masking, 0)
 
-            # For causal, every tile may contain (q,k) with k > q; we must apply per-element mask for all Q tiles.
             is_masked_tile = (
-                leading_causal_masking
-                or trailing_residual_masking
-                or self.has_sliding_window
-                or cutlass.const_expr(self.is_causal)
+                leading_causal_masking or trailing_residual_masking or self.has_sliding_window
             )
 
             # Compute P = softmax(S, LSE)
@@ -2654,8 +2709,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
             log2_e = cutlass.Float32(math.log2(math.e))
             softmax_scale_log2_e = scale_softmax * log2_e
+            ex2_emu_res = self.ex2_emu_res_varlen if cutlass.const_expr(varlen) else 0
 
-            for i in cutlass.range(0, cute.size(tTR_rST), 2, unroll_full=True):
+            for i in cutlass.range_constexpr(0, cute.size(tTR_rST), 2):
                 lse = (
                     -sLSE[
                         cute.get(tTR_cST[i], mode=[1]),
@@ -2671,8 +2727,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     (softmax_scale_log2_e, softmax_scale_log2_e),
                     lse,
                 )
-                tTR_rST[i] = cute.math.exp2(tTR_rST[i], fastmath=True)
-                tTR_rST[i + 1] = cute.math.exp2(tTR_rST[i + 1], fastmath=True)
+                if cutlass.const_expr(i % self.ex2_emu_freq >= self.ex2_emu_freq - ex2_emu_res):
+                    tTR_rST[i], tTR_rST[i + 1] = fa_utils.ex2_emulation_2(
+                        tTR_rST[i], tTR_rST[i + 1]
+                    )
+                else:
+                    tTR_rST[i] = cute.math.exp2(tTR_rST[i], fastmath=True)
+                    tTR_rST[i + 1] = cute.math.exp2(tTR_rST[i + 1], fastmath=True)
 
             # convert fp32 P to fp16 P which will be used in the PdO
             tTR_rPT = self.quantize(tTR_rST, dV.element_type)  # tTR_rST is ST in fp32 in RF.
@@ -2685,10 +2746,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 wg_idx,
             )
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=self.compute_sync_bar_id,
-                number_of_threads=self.num_compute_warps * self.threads_per_warp,
-            )
 
             p_handle.commit()
 
@@ -2742,7 +2799,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     (tTR_rdPT[i], tTR_rdPT[i + 1]), (tTR_rST[i], tTR_rST[i + 1])
                 )
             # For causal, force dS to zero at masked (q,k) so dK/dV accumulation is correct
-            if cutlass.const_expr(self.is_causal):
+            if cutlass.const_expr(self.is_causal) and is_masked_tile:
                 for i in cutlass.range(cute.size(tTR_rdPT), unroll_full=True):
                     c_transpose = tTR_cdPT[i]
                     pos = (
@@ -2766,10 +2823,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 wg_idx,
             )
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=self.compute_sync_bar_id,
-                number_of_threads=self.num_compute_warps * self.threads_per_warp,
-            )
 
             ds_handle.commit()
             sum_odo_handle.release()

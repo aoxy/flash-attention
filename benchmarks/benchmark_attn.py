@@ -41,6 +41,7 @@ if torch.cuda.get_device_capability()[0] != 9:
 
 from triton.testing import do_bench
 
+from benchmark_attn_grid import make_cu_seqlens_q, summarize_lengths
 
 # ── Autograd backward helper ────────────────────────────────────────────────
 
@@ -251,6 +252,53 @@ def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -
     return peak
 
 
+def fragmentary_flops(
+    varlen_lengths_cpu,
+    nheads,
+    headdim,
+    headdim_v,
+    causal=False,
+    window_size=(None, None),
+    has_qv=False,
+):
+    eff_headdim = headdim + headdim_v if has_qv else headdim
+
+    total_flops = 0.0
+
+    for L in varlen_lengths_cpu.tolist():
+        if causal:
+            avg_k = (L + 1) / 2
+        elif window_size == (None, None):
+            avg_k = L
+        else:
+            left, right = window_size
+
+            row = torch.arange(L)
+
+            col_left = (
+                torch.clamp(row - left, min=0)
+                if left is not None
+                else torch.zeros_like(row)
+            )
+
+            col_right = (
+                torch.clamp(row + right, max=L - 1)
+                if right is not None
+                else torch.full_like(row, L - 1)
+            )
+
+            avg_k = (col_right - col_left + 1).float().mean().item()
+
+        total_flops += (
+            nheads
+            * 2
+            * L
+            * avg_k
+            * (eff_headdim + headdim_v)
+        )
+
+    return total_flops
+
 def get_peak_bandwidth(device_index: int = 0) -> float | None:
     """Return peak HBM bandwidth in bytes/sec for the given device. Returns None if unknown."""
     _PEAK_BW = {
@@ -323,6 +371,7 @@ def parse_args():
     parser.add_argument('--fwd', action='store_true', help='Run forward only')
     parser.add_argument('--bwd', action='store_true', help='Run backward only')
     parser.add_argument('--varlen', action='store_true', default=False)
+    parser.add_argument('--fragmentary', action='store_true', default=True)
     parser.add_argument('--causal', type=str.lower, choices=['true', 'false', 'both'], default='both',
                         help='Causal mode (default: both)')
     parser.add_argument('--seqlen', type=csv_ints, default=[8192],
@@ -468,8 +517,27 @@ def main():
             if varlen:
                 q_unpad, k_unpad, v_unpad, qv_unpad = [rearrange(x.detach(), "b s h d -> (b s) h d").requires_grad_(has_backward) if x is not None else None for x in [q, k, v, qv]]
                 g_unpad = rearrange(g.detach(), "b s h d -> (b s) h d")
-                cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
-                cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
+                if args.fragmentary:
+                    assert seqlen == seqlen_q
+                    varlen_cu_seqlens_cpu, varlen_lengths_cpu = make_cu_seqlens_q(
+                        total_len=batch_size * seqlen_q,
+                        device="cpu",
+                        seed=123,
+                        return_lengths=True,
+                    )
+                    varlen_stats = summarize_lengths(varlen_lengths_cpu)
+                    cu_seqlens_q = varlen_cu_seqlens_cpu.to(device=device)
+                    cu_seqlens_k = cu_seqlens_q if page_size is None else None
+                    print(
+                        "Varlen lengths: "
+                        f"total_len={cu_seqlens_q[-1]}, batch={int(varlen_lengths_cpu.numel())}, "
+                        f"min={varlen_stats['min_seqlen']}, p50={varlen_stats['p50_seqlen']:.1f}, "
+                        f"p90={varlen_stats['p90_seqlen']:.1f}, p99={varlen_stats['p99_seqlen']:.1f}, "
+                        f"max={varlen_stats['max_seqlen']}, pct_lt_100={varlen_stats['pct_lt_100']:.3f}"
+                    )
+                else:
+                    cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
+                    cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
 
             # Paged KV tensors
             k_paged = v_paged = page_table = None
@@ -573,6 +641,8 @@ def main():
             has_qv = (headdim == 64 and headdim_v == 512)
             seqlen_k_eff = gather_kv_eff if gather_kv_eff is not None else seqlen
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen_k_eff, headdim, headdim_v, causal=causal, has_qv=has_qv)
+            if varlen and args.fragmentary:
+                nFLOPS = fragmentary_flops(varlen_lengths_cpu, nheads, headdim, headdim_v, causal=causal, has_qv=has_qv)
             dtype_bytes = 1 if dtype == torch.float8_e4m3fn else 2
             if direction == "FWD":
                 nbytes = bandwidth_fwd_bytes(batch_size, nheads, nheads_kv, seqlen_q, seqlen_k_eff,

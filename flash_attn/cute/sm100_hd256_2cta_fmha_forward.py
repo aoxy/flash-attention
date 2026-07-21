@@ -16,9 +16,11 @@ from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     ClcState,
+    TileSchedulerArguments,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
+    Sm100FmhaVarlenTileScheduler as FmhaVarlenTileScheduler,
     Sm100FmhaStaticTileScheduler as FmhaStaticTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
@@ -54,6 +56,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        max_seqlen_q: int | None = None,
+        uniform_varlen: bool = False,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -111,6 +115,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.is_local = is_local
         self.use_semantic_trip_range = is_causal or is_local
         self.use_clc_scheduler = False
+        self.max_seqlen_q = max_seqlen_q
+        self.uniform_varlen = uniform_varlen
 
         self.softmax_warp_ids = (0, 1, 2, 3)
         self.correction_warp_ids = (4, 5, 6, 7)
@@ -336,10 +342,20 @@ class BlackwellFusedMultiHeadAttentionForward:
         o = cute.make_tensor(o_tensor.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (s, ((h_r, h_k), b))
-            lse_layout = cute.make_layout(
-                (s_lse64, ((h_r, h_k), b_lse)),
-                stride=(1, ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
-            )
+            if cutlass.const_expr(self.uniform_varlen):
+                head_stride_lse = b64 * s_lse64
+                lse_layout = cute.make_layout(
+                    (s_lse64, ((h_r, h_k), b_lse)),
+                    stride=(
+                        1,
+                        ((head_stride_lse, h_r64 * head_stride_lse), s_lse64),
+                    ),
+                )
+            else:
+                lse_layout = cute.make_layout(
+                    (s_lse64, ((h_r, h_k), b_lse)),
+                    stride=(1, ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
+                )
             lse = cute.make_tensor(lse_tensor.iterator, lse_layout)
         else:
             lse = None
@@ -351,15 +367,33 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            tile_sched_args = TileSchedulerArguments(
+                num_block=cute.ceil_div(cute.size(o.shape[0]), self.cta_tiler[0]),
+                num_head=cute.size(o.shape[2][0]),
+                num_batch=b,
+                num_splits=1,
+                seqlen_k=cute.size(k.shape[0]),
+                headdim=d,
+                headdim_v=d,
+                total_q=cute.size(o.shape[0]),
+                tile_shape_mn=self.cta_tiler[:2],
+                cluster_shape_mn=self.cluster_shape_mn,
+                mCuSeqlensQ=cum_seqlen_q,
+            )
+            self.tile_sched_params = FmhaVarlenTileScheduler.to_underlying_arguments(
+                tile_sched_args
+            )
+            grid = FmhaVarlenTileScheduler.get_grid_shape(self.tile_sched_params)
+        elif cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (s_q, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (s_q, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -573,7 +607,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: FmhaStaticTileSchedulerParams
+        | FmhaClcDynamicTileSchedulerParams
+        | FmhaVarlenTileScheduler.Params,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -774,7 +810,9 @@ class BlackwellFusedMultiHeadAttentionForward:
             if warp_idx == self.empty_warp_id[_i]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            tile_sched = FmhaVarlenTileScheduler.create(tile_sched_params)
+        elif cutlass.const_expr(self.use_clc_scheduler):
             tile_sched = FmhaClcDynamicTileScheduler.create(
                 tile_sched_params,
                 cute.arch.block_idx(),
