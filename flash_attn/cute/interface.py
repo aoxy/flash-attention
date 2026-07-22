@@ -58,6 +58,18 @@ from flash_attn.cute.block_sparsity import (
     get_block_sparse_broadcast_pattern,
 )
 
+
+@lru_cache(maxsize=1)
+def _use_legacy_cute_sink_impl() -> bool:
+    return os.environ.get("MMQ_FA_CUTE_USE_LEGACY_SINK", "1") == "1"
+
+
+def _legacy_interface():
+    from flash_attn.cute import interface_legacy
+
+    return interface_legacy
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -340,6 +352,9 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
+    if _use_legacy_cute_sink_impl():
+        return _legacy_interface()._flash_attn_fwd(**locals())
+
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
     num_head, head_dim = q.shape[-2:]
@@ -1338,6 +1353,9 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    if _use_legacy_cute_sink_impl():
+        return _legacy_interface()._flash_attn_bwd(**locals())
+
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -2325,6 +2343,9 @@ def flash_attn_func(
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
+    if _use_legacy_cute_sink_impl():
+        return _legacy_interface().flash_attn_func(**locals())
+
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2392,6 +2413,9 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
+    if _use_legacy_cute_sink_impl():
+        return _legacy_interface().flash_attn_varlen_func(**locals())
+
     return FlashAttnVarlenFunc.apply(
         q,
         k,

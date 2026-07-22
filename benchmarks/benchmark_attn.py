@@ -625,7 +625,7 @@ def main():
             header += f" {'seqlen_q':>8} {'seqlen_kv':>9}"
         else:
             header += f" {'seqlen':>6}"
-        header += f" {'has_sink':>6}"
+        header += f" {'has_sink':>8}"
         if show_gather_kv_col:
             header += f" {'gather_kv':>6}"
         for b in shown_backends:
@@ -656,7 +656,7 @@ def main():
                 row += f" {seqlen_q:>8} {seqlen:>9}"
             else:
                 row += f" {seqlen:>6}"
-            row += f" {str(has_sink):>6}"
+            row += f" {str(has_sink):>8}"
             if show_gather_kv_col:
                 row += f" {str(gather_kv_eff) if gather_kv_eff is not None else '—':>6}"
             for b in shown_backends:
