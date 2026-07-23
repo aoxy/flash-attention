@@ -2869,3 +2869,88 @@ def test_flash_attn_empty_q_varlen(causal):
     assert out.numel() == 0
     if lse is not None:
         assert lse.numel() == 0
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only kernel selection")
+@pytest.mark.parametrize(
+    ("num_heads", "num_kv_heads", "window_size"),
+    [(24, 2, (None, None)), (6, 1, (127, 0))],
+    ids=("causal", "causal-window-128"),
+)
+def test_flash_attn_hd256_short_ragged_pack_gqa_sink(
+    num_heads, num_kv_heads, window_size
+):
+    lengths = (257, 129, 64)
+    total_tokens = sum(lengths)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        total_tokens,
+        num_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        total_tokens,
+        num_kv_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        total_tokens,
+        num_kv_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    sink = torch.randn(num_heads, device=device, dtype=dtype, requires_grad=True)
+    dout = torch.randn_like(q)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        window_size=window_size,
+        learnable_sink=sink,
+    )
+
+    q_ref, k_ref, v_ref, sink_ref = (
+        tensor.detach().clone().requires_grad_() for tensor in (q, k, v, sink)
+    )
+    out_ref = []
+    offset = 0
+    for length in lengths:
+        out_seq, _ = attention_ref(
+            q_ref[offset : offset + length].unsqueeze(0),
+            k_ref[offset : offset + length].unsqueeze(0),
+            v_ref[offset : offset + length].unsqueeze(0),
+            causal=True,
+            window_size=window_size,
+            learnable_sink=sink_ref,
+        )
+        out_ref.append(out_seq.squeeze(0))
+        offset += length
+    out_ref = torch.cat(out_ref)
+
+    grads = torch.autograd.grad(out, (q, k, v, sink), dout)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, sink_ref), dout)
+    torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2)
+    for actual, expected in zip(grads, grads_ref):
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=6e-2)
