@@ -1818,8 +1818,6 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             use_2cta_instrs,
-            max_seqlen_q if use_dedicated_hd256_kernel and cu_seqlens_q is not None else None,
-            max_seqlen_k if use_dedicated_hd256_kernel and cu_seqlens_k is not None else None,
             deterministic,
             spt,
             score_mod_hash,
@@ -1954,8 +1952,6 @@ def _flash_attn_bwd(
                     tile_n_dkdv=dkdv_tile_mn[1],
                     window_size_left=window_size_left,
                     window_size_right=window_size_right,
-                    max_seqlen_q=max_seqlen_q,
-                    max_seqlen_k=max_seqlen_k,
                 )
             else:
                 fa_bwd_obj = FlashAttentionBackwardSm100(

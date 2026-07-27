@@ -123,8 +123,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         window_size_left: int | None = None,
         window_size_right: int | None = None,
         use_clc_scheduler: bool = False,
-        max_seqlen_q: int | None = None,
-        max_seqlen_k: int | None = None,
     ):
         """Initialization."""
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
@@ -174,7 +172,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             False,  # is_persistent
             False,  # split_head
             use_clc_scheduler=self.use_clc_scheduler,
-            max_seqlen_q=max_seqlen_q,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
             self.acc_dtype,
@@ -183,7 +180,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.window_size_left,
             self.window_size_right,
             use_clc_scheduler=self.use_clc_scheduler,
-            max_seqlen_k=max_seqlen_k,
         )
 
     @cute.jit

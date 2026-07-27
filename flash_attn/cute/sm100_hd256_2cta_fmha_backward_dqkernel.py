@@ -47,7 +47,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         is_persistent: bool,
         split_head: bool,
         use_clc_scheduler: bool = False,
-        max_seqlen_q: int | None = None,
     ):
         self.acc_dtype = acc_dtype
         self.mma_tiler = mma_tiler
@@ -93,7 +92,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.is_persistent = is_persistent
         self.use_clc_scheduler = use_clc_scheduler
         self.use_semantic_trip_range = self.is_causal or self.is_local
-        self.max_seqlen_q = max_seqlen_q
 
         self.compute_warp_ids = (0, 1, 2, 3)
         self.epilogue_warp_ids = (4, 5, 6, 7)

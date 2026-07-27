@@ -371,7 +371,7 @@ def parse_args():
     parser.add_argument('--fwd', action='store_true', help='Run forward only')
     parser.add_argument('--bwd', action='store_true', help='Run backward only')
     parser.add_argument('--varlen', action='store_true', default=False)
-    parser.add_argument('--fragmentary', action='store_true', default=True)
+    parser.add_argument('--fragmentary', action='store_true', default=False)
     parser.add_argument('--causal', type=str.lower, choices=['true', 'false', 'both'], default='both',
                         help='Causal mode (default: both)')
     parser.add_argument('--seqlen', type=csv_ints, default=[8192],

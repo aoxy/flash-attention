@@ -13,6 +13,8 @@ import torch
 
 from einops import rearrange, repeat
 
+import flash_attn.cute.interface as cute_interface
+
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
 except ImportError:
@@ -2954,3 +2956,110 @@ def test_flash_attn_hd256_short_ragged_pack_gqa_sink(
     torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2)
     for actual, expected in zip(grads, grads_ref):
         torch.testing.assert_close(actual, expected, rtol=5e-2, atol=6e-2)
+
+
+def _run_hd256_ragged_sink_case(lengths):
+    total_tokens = sum(lengths)
+    device = "cuda"
+    dtype = torch.bfloat16
+    num_heads = 4
+    num_kv_heads = 1
+
+    q = torch.randn(
+        total_tokens,
+        num_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        total_tokens,
+        num_kv_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    v = torch.randn(
+        total_tokens,
+        num_kv_heads,
+        256,
+        device=device,
+        dtype=dtype,
+        requires_grad=True,
+    )
+    sink = torch.randn(num_heads, device=device, dtype=dtype, requires_grad=True)
+    dout = torch.randn_like(q)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        causal=True,
+        learnable_sink=sink,
+    )
+
+    q_ref, k_ref, v_ref, sink_ref = (
+        tensor.detach().clone().requires_grad_() for tensor in (q, k, v, sink)
+    )
+    out_ref = []
+    offset = 0
+    for length in lengths:
+        out_seq, _ = attention_ref(
+            q_ref[offset : offset + length].unsqueeze(0),
+            k_ref[offset : offset + length].unsqueeze(0),
+            v_ref[offset : offset + length].unsqueeze(0),
+            causal=True,
+            learnable_sink=sink_ref,
+        )
+        out_ref.append(out_seq.squeeze(0))
+        offset += length
+    out_ref = torch.cat(out_ref)
+
+    grads = torch.autograd.grad(out, (q, k, v, sink), dout)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, sink_ref), dout)
+    torch.testing.assert_close(out, out_ref, rtol=2e-2, atol=2e-2)
+    for actual, expected in zip(grads, grads_ref):
+        torch.testing.assert_close(actual, expected, rtol=5e-2, atol=6e-2)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only kernel selection")
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires real CUDA execution for correctness checks")
+def test_flash_attn_hd256_sink_bwd_cache_reuses_across_max_seqlen():
+    cache = _flash_attn_bwd.compile_cache.cache
+    cache.clear()
+    old_legacy_sink = os.environ.get("MMQ_FA_CUTE_USE_LEGACY_SINK")
+    os.environ["MMQ_FA_CUTE_USE_LEGACY_SINK"] = "0"
+    cute_interface._use_legacy_cute_sink_impl.cache_clear()
+
+    try:
+        torch.manual_seed(0)
+        _run_hd256_ragged_sink_case((160, 96))
+        entries_after_first = len(cache)
+
+        # Same bucket: max_seqlen differs, but both sides need >1 block.
+        torch.manual_seed(1)
+        _run_hd256_ragged_sink_case((192, 64))
+        entries_after_second = len(cache)
+        assert entries_after_second == entries_after_first
+
+        # Crossing the one-block bucket should still specialize separately.
+        torch.manual_seed(2)
+        _run_hd256_ragged_sink_case((96, 64))
+        assert len(cache) == entries_after_second + 1
+    finally:
+        if old_legacy_sink is None:
+            os.environ.pop("MMQ_FA_CUTE_USE_LEGACY_SINK", None)
+        else:
+            os.environ["MMQ_FA_CUTE_USE_LEGACY_SINK"] = old_legacy_sink
+        cute_interface._use_legacy_cute_sink_impl.cache_clear()

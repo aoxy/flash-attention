@@ -105,13 +105,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         window_size_left: int | None,
         window_size_right: int | None,
         use_clc_scheduler: bool = False,
-        max_seqlen_k: int | None = None,
     ):
         """Initialization."""
         self.acc_dtype = acc_dtype
         self.cta_tiler = cta_tiler
         self.use_clc_scheduler = use_clc_scheduler
-        self.max_seqlen_k = max_seqlen_k
         self.sched_warp_id = 10 if use_clc_scheduler else None
         # TODO: need check, not sure whether need to *2 if 2cta
         self.tile_shape_Q = cta_tiler[0]
