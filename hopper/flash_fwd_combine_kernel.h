@@ -22,7 +22,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MK_, int kLogMaxSplits_, int kNThreads, int AlignmentLSE_,
-          bool Is_even_K, bool Varlen, class Element, class ElementPartial, class ArchTag_>
+          bool Is_even_K, bool Varlen, class Element, class ElementPartial, class ArchTag_, bool Has_sink>
 class FlashAttnFwdCombine {
 
 public:
@@ -147,6 +147,7 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        float const* const ptr_Sink = nullptr;
     };
 
     // Kernel entry point API
@@ -167,6 +168,7 @@ public:
         int const* const num_splits_dynamic_ptr = nullptr;
         int const* const varlen_batch_idx_ptr = nullptr;
         int* const semaphore_to_reset = nullptr;
+        float const* const ptr_Sink = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -191,7 +193,7 @@ public:
             args.num_splits_dynamic_ptr,
             args.varlen_batch_idx_ptr,
             args.semaphore_to_reset,
-            
+            args.ptr_Sink
         };
     }
 
@@ -374,6 +376,20 @@ public:
             }
             SumOp<float> sum_op;
             lse_sum_cur = Allreduce<kSmemThreadsPerColLSEt>::run(lse_sum_cur, sum_op);
+            if constexpr (Has_sink) {
+                int mi = int(get<1>(ts2rcLSE(_0{}, _0{}, m)));
+                int idx = m_block * kBlockM + mi;
+                if (idx < max_idx) {
+                    int m_idx, bidh;
+                    if constexpr (!Varlen) {
+                        bidh = params.seqlen_divmod.divmod(m_idx, idx);
+                    } else {
+                        bidh = seqlen_divmod_dynamic.divmod(m_idx, idx);
+                    }
+                    const float sink_val_exp = expf((params.ptr_Sink)[bidh] - lse_max_cur);
+                    lse_sum_cur += sink_val_exp;
+                }
+            }
             lse_sum(m) = logf(lse_sum_cur) + lse_max;
             float inv_sum = (lse_sum_cur == 0.f || lse_sum_cur != lse_sum_cur) ? 0.f : 1.f / lse_sum_cur;
             #pragma unroll

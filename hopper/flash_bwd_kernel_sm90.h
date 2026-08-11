@@ -42,6 +42,7 @@ public:
     using MainloopArguments = typename CollectiveMainloop::Arguments;
     using MainloopParams = typename CollectiveMainloop::Params;
     static constexpr bool dKV_swapAB = CollectiveMainloop::dKV_swapAB;
+    static constexpr bool Has_sink = CollectiveMainloop::Has_sink;
 
     // Epilogue derived types
     using CollectiveEpilogue = CollectiveEpilogue_;
@@ -67,6 +68,7 @@ public:
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
     // static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 152;
+
 
     // Kernel level shared memory storage
     struct SharedStorage {
@@ -261,16 +263,16 @@ public:
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
                 Tensor tdVrdV = partition_fragment_C(tiled_mma_dKV, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
+                float dsink_val = 0.0f;
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do, smem_pipe_read, smem_pipe_read_do,
-                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage);
+                    tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx, block_coord, shared_storage, dsink_val);
                 if (tile_valid) {
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage, tiled_mma_dKV,
-                                   threadIdx.x - NumCopyThreads, block_coord);
+                                   threadIdx.x - NumCopyThreads, block_coord, dsink_val);
                 } else {
                     epilogue.store_zero(params.epilogue, threadIdx.x - NumCopyThreads, block_coord);
                 }
-
             }
             epilogue.store_tail();
         }
